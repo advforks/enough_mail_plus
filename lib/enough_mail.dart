@@ -16,3 +16,4 @@ export 'mime.dart';
 export 'pop.dart';
 export 'smtp.dart';
 export 'src/exception.dart';
+export 'src/mail_crypto.dart';

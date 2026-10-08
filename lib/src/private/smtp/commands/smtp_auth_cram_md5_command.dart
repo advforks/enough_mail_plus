@@ -1,8 +1,7 @@
 import 'dart:convert';
 import 'dart:typed_data';
 
-import 'package:crypto/crypto.dart';
-
+import '../../../mail_crypto.dart';
 import '../../../smtp/smtp_response.dart';
 import '../smtp_command.dart';
 
@@ -48,13 +47,15 @@ S: 235 Authentication succeeded
     // BASE64(USERNAME, " ",
     //        MD5((SECRET XOR opad),MD5((SECRET XOR ipad), NONCE)))
     var password = utf8.encode(_password);
+    final crypto = MailCrypto.current;
     if (password.length > 64) {
-      final passwordDigest = md5.convert(password);
-      password = Uint8List.fromList(passwordDigest.bytes);
+      password = crypto.md5(password);
     }
     final nonce = base64.decode(base64Nonce);
-    final hmac = Hmac(md5, password);
-    final hmacNonce = hmac.convert(nonce);
+    final hmacNonce = crypto
+        .hmacMd5(password, nonce)
+        .map((b) => b.toRadixString(16).padLeft(2, '0'))
+        .join();
     final input = '$_userName $hmacNonce';
     final complete = utf8.encode(input);
     final authBase64Text = base64.encode(complete);

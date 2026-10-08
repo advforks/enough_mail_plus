@@ -1,7 +1,6 @@
 import 'dart:async';
 import 'dart:io';
 
-import 'package:basic_utils/basic_utils.dart' as basic;
 import 'package:collection/collection.dart' show IterableExtension;
 import 'package:xml/xml.dart' as xml;
 
@@ -76,10 +75,17 @@ class DiscoverHelper {
     return discoverMxDomain(domain);
   }
 
+  /// Resolves the MX records of a domain. Each entry is the record data
+  /// (`priority host.`), in answer order.
+  ///
+  /// enough_mail makes no DNS requests itself. Without a resolver set by the
+  /// app, [discoverMxDomain] returns `null`.
+  static Future<List<String>?> Function(String domain)? mxLookup;
+
   /// Looks up domain referenced by the domain's DNS MX record
   static Future<String?> discoverMxDomain(String domain) async {
-    final mxRecords =
-        await basic.DnsUtils.lookupRecord(domain, basic.RRecordType.MX);
+    final lookup = mxLookup;
+    final mxRecords = lookup == null ? null : await lookup(domain);
     if (mxRecords == null || mxRecords.isEmpty) {
       //print('unable to read MX records for [$domain].');
       return null;
@@ -89,7 +95,7 @@ class DiscoverHelper {
     //       'mx for [$domain]: ${mxRecord.name}=${mxRecord.data}  '
     //       '- rType=${mxRecord.rType}');
     // }
-    var mxDomain = mxRecords.first.data;
+    var mxDomain = mxRecords.first;
     final dotIndex = mxDomain.indexOf('.');
     if (dotIndex == -1) {
       return null;

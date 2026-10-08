@@ -6,6 +6,13 @@ import 'client_config.dart';
 ///
 /// Use [discover] to initiate the discovery process.
 class Discover {
+  /// Resolver for a domain's MX records, each entry `priority host.`.
+  ///
+  /// enough_mail makes no DNS requests itself; without a resolver the MX
+  /// based discovery step is skipped.
+  static set mxLookup(Future<List<String>?> Function(String domain)? lookup) =>
+      DiscoverHelper.mxLookup = lookup;
+
   Discover._();
 
   /// Tries to discover mail settings for the specified [emailAddress].

@@ -1,7 +1,6 @@
 import 'dart:convert';
 
-import 'package:crypto/crypto.dart';
-
+import '../../../mail_crypto.dart';
 import '../pop_command.dart';
 
 /// The `APOP` command signs in the user
@@ -16,10 +15,13 @@ class PopApopCommand extends PopCommand<String> {
   /// Generates the MD5 hash from the [input]
   static String toMd5(String input) {
     final inputBytes = utf8.encode(input);
-    final digest = md5.convert(inputBytes);
+    final digest = MailCrypto.current.md5(inputBytes);
 
-    return digest.toString();
+    return _hex(digest);
   }
+
+  static String _hex(List<int> bytes) =>
+      bytes.map((b) => b.toRadixString(16).padLeft(2, '0')).join();
 
   @override
   String toString() => 'APOP $user <MD5 scrambled>';

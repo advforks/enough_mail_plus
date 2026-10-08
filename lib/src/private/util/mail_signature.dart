@@ -1,16 +1,12 @@
 import 'dart:convert';
 
-import 'package:crypto/crypto.dart';
-import 'package:encrypter_plus/encrypter_plus.dart';
-import 'package:pointycastle/pointycastle.dart' show RSAPrivateKey;
-
+import '../../mail_crypto.dart';
 import '../../message_builder.dart';
 import '../../mime_message.dart';
 import 'non_nullable.dart';
 
 /// Extends Message Builder with signature methods
 extension MailSignature on MessageBuilder {
-  static final RSAKeyParser _rsaKeyParser = RSAKeyParser();
   static const List<String> _signedHeaders = [
     'from', /*, 'to', 'mime-version'*/
   ];
@@ -51,7 +47,7 @@ extension MailSignature on MessageBuilder {
       );
 
   String _hash(String target) =>
-      base64.encode(sha256.convert(utf8.encode(target)).bytes);
+      base64.encode(MailCrypto.current.sha256(utf8.encode(target)));
   String _relaxedHeaderValue(Header head) {
     final headValue = head.value?.replaceAll(RegExp(r'\r|\n'), ' ') ?? '';
 
@@ -87,12 +83,21 @@ extension MailSignature on MessageBuilder {
   }
 
   String _sign(String privateKeyText, String value) {
-    final privateKey = _rsaKeyParser.parse(privateKeyText) as RSAPrivateKey?;
-    final data = utf8.encode(value);
+    final der = _pemToDer(privateKeyText);
+    final signature =
+        MailCrypto.current.rsaSha256Sign(der, utf8.encode(value));
 
-    return RSASigner(RSASignDigest.SHA256, privateKey: privateKey)
-        .sign(data)
-        .base64;
+    return base64.encode(signature);
+  }
+
+  static List<int> _pemToDer(String pem) {
+    final body = pem
+        .split(RegExp(r'\r?\n'))
+        .map((line) => line.trim())
+        .where((line) => line.isNotEmpty && !line.startsWith('-----'))
+        .join();
+
+    return base64.decode(body);
   }
 
   /// Signs the builder with the given [privateKey]

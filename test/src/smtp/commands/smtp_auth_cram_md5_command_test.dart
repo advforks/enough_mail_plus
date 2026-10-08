@@ -3,9 +3,13 @@ import 'dart:convert';
 import 'package:enough_mail/enough_mail.dart';
 import 'package:enough_mail/src/private/smtp/commands/all_commands.dart';
 import 'package:test/test.dart';
+
+import '../../../support/test_mail_crypto.dart';
 // cSpell:disable
 
 void main() {
+  setUpAll(TestMailCrypto.install);
+
   group('CRAM MD5 Tests', () {
     test('Stackoverflow 1', () {
       // source: https://stackoverflow.com/questions/186827/smtp-with-cram-md5-in-java
