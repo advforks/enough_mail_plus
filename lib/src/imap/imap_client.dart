@@ -2623,13 +2623,23 @@ class ImapClient extends ClientBase {
     task.completer.future.then(
       (_) {},
       onError: (Object error, StackTrace stack) {
+        // idleDone(), disconnect() and connection errors have already cleared
+        // one of these and report the failure themselves.
+        final wasIdling = _isInIdleMode && identical(_idleCommandTask, task);
+        if (wasIdling || _idleCommandTask == null) _isInIdleMode = false;
+        if (wasIdling) _idleCommandTask = null;
+
         // A server that refuses IDLE answers with a tagged reply, never `+`.
-        _isInIdleMode = false;
         if (continuationCompleter != null &&
             identical(_idleContinuationCompleter, continuationCompleter)) {
           _idleContinuationCompleter = null;
           continuationCompleter.completeError(error, stack);
+
+          return;
         }
+        // idleStart() has already returned, so nobody else can learn that IDLE
+        // ended. The socket may still be up, and no new mail would be reported.
+        if (wasIdling && isConnected) onConnectionError(error);
       },
     );
     sendCommandTask(task, returnCompleter: false);

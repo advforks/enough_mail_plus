@@ -1722,6 +1722,92 @@ void main() {
     await expectation;
   });
 
+  group('IDLE failures', () {
+    late List<ImapEvent> lost;
+
+    setUp(() async {
+      await _selectInbox();
+      mockServer.response =
+          '* CAPABILITY IMAP4rev1 IDLE AUTH=PLAIN\r\n'
+          '<tag> OK LOGIN completed';
+      await client.login('testuser', 'testpassword');
+      lost = [];
+      final events = client.eventStream
+          .where((event) => event is ImapConnectionLostEvent)
+          .listen(lost.add);
+      addTearDown(events.cancel);
+    });
+
+    Future<void> settle() =>
+        Future<void>.delayed(const Duration(milliseconds: 30));
+
+    Future<void> startIdling() async {
+      mockServer.response = '+ idling\r\n';
+      await client.idleStart(waitForContinuation: true);
+    }
+
+    test('reports IDLE ending after the server accepted it', () async {
+      await startIdling();
+
+      mockServer.replyToContinuation('NO IDLE terminated');
+      await settle();
+
+      expect(lost, hasLength(1));
+    });
+
+    test('reports IDLE refused when idleStart did not wait', () async {
+      mockServer.response = '<tag> NO IDLE disabled';
+
+      await client.idleStart();
+      await settle();
+
+      expect(lost, hasLength(1));
+    });
+
+    test('a refused idleStart that waited only throws', () async {
+      mockServer.response = '<tag> NO IDLE disabled';
+
+      await expectLater(
+        client.idleStart(waitForContinuation: true),
+        throwsA(isA<ImapException>()),
+      );
+      await settle();
+
+      expect(lost, isEmpty);
+    });
+
+    test('a refused DONE only throws from idleDone', () async {
+      await startIdling();
+      mockServer.response = '<tag> NO DONE failed';
+
+      await expectLater(client.idleDone(), throwsA(isA<ImapException>()));
+      await settle();
+
+      expect(lost, isEmpty);
+    });
+
+    test('disconnecting while idling reports nothing', () async {
+      await startIdling();
+
+      await client.disconnect();
+      await settle();
+
+      expect(lost, isEmpty);
+    });
+
+    test('a later idleStart works after IDLE ended', () async {
+      await startIdling();
+      mockServer.replyToContinuation('NO IDLE terminated');
+      await settle();
+
+      await _selectInbox();
+      mockServer.response = '+ idling\r\n';
+      await client.idleStart(waitForContinuation: true);
+
+      expect(lost, hasLength(1));
+    });
+  });
+
   test('ImapClient idle waitForContinuation fails when IDLE is refused',
       () async {
     await _selectInbox();

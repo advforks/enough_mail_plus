@@ -56,6 +56,12 @@ class MockImapServer {
     }
   }
 
+  /// Sends the tagged reply to the command that got a `+` continuation.
+  void replyToContinuation(String text) {
+    writeln('$_overrideTag $text');
+    _overrideTag = null;
+  }
+
   void writeln(String data) {
     write('$data\r\n');
   }
