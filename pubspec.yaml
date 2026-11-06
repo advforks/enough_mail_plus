@@ -1,9 +1,7 @@
 name: enough_mail
-description: IMAP, POP3 and SMTP for email developers. Choose between a low
-  level and a high level API for mailing. Parse and generate MIME messages.
-  Discover email settings.
-version: 2.1.7
-homepage: https://github.com/Enough-Software/enough_mail
+description: "enough_mail - IMAP, POP3, SMTP email library with high/low-level APIs and MIME parsing"
+version: 3.0.0
+repository: https://github.com/Enough-Software/enough_mail
 topics:
   - email
   - imap
@@ -13,30 +11,27 @@ topics:
 
 
 environment:
-  sdk: '>=3.0.0 <4.0.0'
+  sdk: '>=3.11.5 <4.0.0'
 
 dependencies:
   collection: ^1.19.1
-  # encrypt: ^5.0.3
   enough_convert: ^1.6.0
-  event_bus: ^2.0.1
-  intl: any
-  json_annotation: ^4.9.0
+  intl: ^0.20.2
+  json_annotation: ^4.8.1
   synchronized: ^3.4.0
-  xml: ">=6.0.0 <7.0.0"
-
-dependency_overrides:
-  # http: ^1.4.0 # for dart_code_metrics
-
+  xml: ">=6.0.0 <8.0.0"
+  
 dev_dependencies:
+  # Test-only crypto: the shipped library has no implementation.
+  crypto: ^3.0.6
+  pointycastle: ^4.0.0
   build_runner: ^2.6.0
-  # dart_code_metrics: 5.7.6
-  dart_code_linter: ^3.0.0
+  dart_code_linter: ^4.0.2
   flutter_lints: ^6.0.0
   json_serializable: ^6.10.0
   lints: ^6.0.0
   test: ^1.26.3
-  # Test-only crypto: the shipped library has no implementation.
-  crypto: ^3.0.6
-  pointycastle: ^4.0.0
-  timezone: ^0.10.1
+  timezone: ^0.11.0
+
+false_secrets:
+  - /test/mail_signature_test.dart

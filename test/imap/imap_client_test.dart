@@ -3,10 +3,10 @@
 
 import 'dart:async';
 import 'dart:io' show Platform;
+import 'dart:typed_data';
 
 import 'package:enough_mail/enough_mail.dart';
 import 'package:enough_mail/src/private/util/client_base.dart';
-import 'package:event_bus/event_bus.dart';
 import 'package:test/test.dart';
 
 import '../mock_socket.dart';
@@ -22,21 +22,29 @@ void main() {
   setUp(() async {
     final envVars = Platform.environment;
     final isLogEnabled = envVars['IMAP_LOG'] == 'true';
-    client = ImapClient(bus: EventBus(sync: true), isLogEnabled: isLogEnabled);
+    client = ImapClient(isLogEnabled: isLogEnabled);
 
-    client.eventBus
-        .on<ImapExpungeEvent>()
+    client.eventStream
+        .where((e) => e is ImapExpungeEvent)
+        .cast<ImapExpungeEvent>()
         .listen((e) => expungedMessages.add(e.messageSequenceId));
-    client.eventBus
-        .on<ImapVanishedEvent>()
+    client.eventStream
+        .where((e) => e is ImapVanishedEvent)
+        .cast<ImapVanishedEvent>()
         .listen((e) => vanishedMessages = e.vanishedMessages);
-    client.eventBus.on<ImapFetchEvent>().listen((e) => fetchEvents.add(e));
+    client.eventStream
+        .where((e) => e is ImapFetchEvent)
+        .cast<ImapFetchEvent>()
+        .listen(fetchEvents.add);
 
     final connection = MockConnection();
     client.connect(
       connection.socketClient,
-      connectionInformation:
-          const ConnectionInfo('imaptest.enough.de', 993, isSecure: true),
+      connectionInformation: const ConnectionInfo(
+        'imaptest.enough.de',
+        993,
+        isSecure: true,
+      ),
     );
     mockServer = MockImapServer(connection.socketServer);
     connection.socketServer.write(
@@ -69,21 +77,29 @@ void main() {
 
   test('ImapClient login without capability', () async {
     // setup own initial response for test:
-    client = ImapClient(bus: EventBus(sync: true), isLogEnabled: false);
+    client = ImapClient(isLogEnabled: false);
 
-    client.eventBus
-        .on<ImapExpungeEvent>()
+    client.eventStream
+        .where((e) => e is ImapExpungeEvent)
+        .cast<ImapExpungeEvent>()
         .listen((e) => expungedMessages.add(e.messageSequenceId));
-    client.eventBus
-        .on<ImapVanishedEvent>()
+    client.eventStream
+        .where((e) => e is ImapVanishedEvent)
+        .cast<ImapVanishedEvent>()
         .listen((e) => vanishedMessages = e.vanishedMessages);
-    client.eventBus.on<ImapFetchEvent>().listen((e) => fetchEvents.add(e));
+    client.eventStream
+        .where((e) => e is ImapFetchEvent)
+        .cast<ImapFetchEvent>()
+        .listen(fetchEvents.add);
 
     final connection = MockConnection();
     client.connect(
       connection.socketClient,
-      connectionInformation:
-          const ConnectionInfo('imap.qq.com', 993, isSecure: true),
+      connectionInformation: const ConnectionInfo(
+        'imap.qq.com',
+        993,
+        isSecure: true,
+      ),
     );
     mockServer = MockImapServer(connection.socketServer);
     connection.socketServer.write(
@@ -113,8 +129,10 @@ void main() {
 
   test('ImapClient authenticateWithOAuth2', () async {
     mockServer.response = '<tag> OK AUTH completed';
-    final authResponse =
-        await client.authenticateWithOAuth2('testuser', 'ABC123456789abc');
+    final authResponse = await client.authenticateWithOAuth2(
+      'testuser',
+      'ABC123456789abc',
+    );
     expect(
       authResponse,
       isNotNull,
@@ -124,8 +142,10 @@ void main() {
 
   test('ImapClient authenticateWithOAuthBearer', () async {
     mockServer.response = '<tag> OK AUTH completed';
-    final authResponse =
-        await client.authenticateWithOAuthBearer('testuser', 'ABC123456789abc');
+    final authResponse = await client.authenticateWithOAuthBearer(
+      'testuser',
+      'ABC123456789abc',
+    );
     expect(
       authResponse,
       isNotNull,
@@ -155,7 +175,8 @@ void main() {
   });
 
   test('ImapClient listMailboxes with escaped Mailbox-Flags', () async {
-    mockServer.response = '* LIST (\\HasChildren \\Marked) "/" INBOX\r\n'
+    mockServer.response =
+        '* LIST (\\HasChildren \\Marked) "/" INBOX\r\n'
         '* LIST (\\HasChildren \\Noselect) "/" Public\r\n'
         '* LIST (\\HasNoChildren \\Trash) "/" Trash\r\n'
         '* LIST (\\HasChildren \\Noselect) "/" Shared\r\n'
@@ -200,8 +221,56 @@ void main() {
     );
   });
 
+  test('ImapClient listMailboxes via LIST-STATUS preserves parentheses in '
+      'mailbox names', () async {
+    // Regression: with isExtended=true (LIST-STATUS return options), the
+    // extended-data parser did listDetails.indexOf('(') which found the '('
+    // inside "INBOX.Financial.Audit(s)" and treated 's)' as extended data.
+    // The path was truncated (removing the closing '"' too), so the
+    // subsequent quote-strip ate the 'i', leaving name='Aud' and a path
+    // that did not exist on the server.
+    mockServer.response =
+        '* LIST (\\HasChildren \\UnMarked) "." "INBOX.Financial.Audit(s)"\r\n'
+        '* STATUS "INBOX.Financial.Audit(s)" (MESSAGES 0 UNSEEN 0)\r\n'
+        '* LIST (\\HasNoChildren \\UnMarked) "." "INBOX.Financial.Home Hardware"\r\n'
+        '* STATUS "INBOX.Financial.Home Hardware" (MESSAGES 40 UNSEEN 0)\r\n'
+        '<tag> OK List completed (0.001 + 0.000 secs).';
+    final listResponse = await client.listMailboxes(
+      path: '"INBOX.Financial."',
+      recursive: false,
+      returnOptions: [
+        ReturnOption.status(['MESSAGES', 'UNSEEN']),
+        ReturnOption.children(),
+      ],
+    );
+    expect(listResponse, hasLength(2));
+
+    final audit = listResponse[0];
+    expect(
+      audit.name,
+      equals('Audit(s)'),
+      reason: 'name was truncated at "(" inside mailbox name',
+    );
+    expect(
+      audit.path,
+      equals('INBOX.Financial.Audit(s)'),
+      reason: 'path was truncated at "(" inside mailbox name',
+    );
+    expect(audit.hasChildren, isTrue);
+
+    final homeHardware = listResponse[1];
+    expect(
+      homeHardware.name,
+      equals('Home Hardware'),
+      reason: 'quoted name with space should be preserved',
+    );
+    expect(homeHardware.path, equals('INBOX.Financial.Home Hardware'));
+    expect(homeHardware.messagesExists, equals(40));
+  });
+
   test('ImapClient LSUB', () async {
-    mockServer.response = '* LSUB (\\HasChildren \\Marked) "/" INBOX\r\n'
+    mockServer.response =
+        '* LSUB (\\HasChildren \\Marked) "/" INBOX\r\n'
         '* LSUB (\\HasChildren \\Noselect) "/" Public\r\n'
         '<tag> OK LSUB completed (0.000 + 0.000 secs).';
     final listResponse = await client.listSubscribedMailboxes();
@@ -273,7 +342,8 @@ void main() {
 
     final archive = listResponse[0];
 
-    mockServer.response = '* 63510 EXISTS\r\n'
+    mockServer.response =
+        '* 63510 EXISTS\r\n'
         '* 23 RECENT\r\n'
         '* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft \$Forwarded \$Unsubscribed)\r\n'
         '* OK [PERMANENTFLAGS (\\Answered \\Flagged \\Draft \\Deleted \\Seen \$Forwarded \$Unsubscribed \\*)] Unlimited\r\n'
@@ -312,36 +382,36 @@ void main() {
       '\$Forwarded',
       '\$Unsubscribed',
     ]);
-    expect(
-      archive.permanentMessageFlags,
-      [
-        '\\Answered',
-        '\\Flagged',
-        '\\Draft',
-        '\\Deleted',
-        '\\Seen',
-        '\$Forwarded',
-        '\$Unsubscribed',
-        '\\*',
-      ],
-      reason: 'permanent message flags expected',
-    );
+    expect(archive.permanentMessageFlags, [
+      '\\Answered',
+      '\\Flagged',
+      '\\Draft',
+      '\\Deleted',
+      '\\Seen',
+      '\$Forwarded',
+      '\$Unsubscribed',
+      '\\*',
+    ], reason: 'permanent message flags expected');
   });
 
   test('ImapClient search', () async {
-    mockServer.response = '* SEARCH 3423 17 3\r\n'
+    mockServer.response =
+        '* SEARCH 3423 17 3\r\n'
         '<tag> OK SEARCH completed';
-    final searchResponse =
-        await client.searchMessages(searchCriteria: 'UNSEEN');
+    final searchResponse = await client.searchMessages(
+      searchCriteria: 'UNSEEN',
+    );
     expect(searchResponse.matchingSequence, isNotNull);
     expect(searchResponse.matchingSequence?.toList(), [3, 17, 3423]);
   });
 
   test('ImapClient uid search', () async {
-    mockServer.response = '* SEARCH 3423 17 3\r\n'
+    mockServer.response =
+        '* SEARCH 3423 17 3\r\n'
         '<tag> OK UID SEARCH completed';
-    final searchResult =
-        await client.uidSearchMessages(searchCriteria: 'UNSEEN');
+    final searchResult = await client.uidSearchMessages(
+      searchCriteria: 'UNSEEN',
+    );
     expect(searchResult.matchingSequence, isNotNull);
     expect(searchResult.matchingSequence?.isNotEmpty, true);
     expect(searchResult.matchingSequence?.toList(), [3, 17, 3423]);
@@ -371,7 +441,8 @@ void main() {
       164,
       163,
     ];
-    mockServer.response = '* SORT ${testSequence.join(' ')}\r\n'
+    mockServer.response =
+        '* SORT ${testSequence.join(' ')}\r\n'
         '<tag> OK SORT Completed';
     final sortResponse = await client.sortMessages('ARRIVAL');
     expect(sortResponse.matchingSequence, isNotNull);
@@ -402,7 +473,8 @@ void main() {
       164,
       163,
     ];
-    mockServer.response = '* SORT ${testSequence.join(' ')}\r\n'
+    mockServer.response =
+        '* SORT ${testSequence.join(' ')}\r\n'
         '<tag> OK UID SORT Completed';
     final sortResponse = await client.uidSortMessages('ARRIVAL');
     expect(sortResponse.matchingSequence, isNotNull);
@@ -480,12 +552,10 @@ void main() {
     mockServer.response =
         '* ESEARCH (TAG "<tag>") COUNT 21 ALL ${testSequence.join(',')}\r\n'
         '<tag> OK UID SORT Completed';
-    final sortResponse = await client.sortMessages(
-      'ARRIVAL',
-      'ALL',
-      'UTF-8',
-      [ReturnOption.count(), ReturnOption.all()],
-    );
+    final sortResponse = await client.sortMessages('ARRIVAL', 'ALL', 'UTF-8', [
+      ReturnOption.count(),
+      ReturnOption.all(),
+    ]);
     expect(sortResponse.matchingSequence, isNotNull);
     expect(sortResponse.matchingSequence?.toList(), testSequence);
     expect(sortResponse.count, 21);
@@ -730,7 +800,8 @@ void main() {
   });
 
   test('ImapClient fetch BODY[HEADER]', () async {
-    mockServer.response = '* 123456 FETCH (BODY[HEADER] {345}\r\n'
+    mockServer.response =
+        '* 123456 FETCH (BODY[HEADER] {345}\r\n'
         'Date: Wed, 17 Jul 1996 02:23:25 -0700 (PDT)\r\n'
         'From: Terry Gray <gray@cac.washington.edu>\r\n'
         'Subject: IMAP4rev1 WG mtg summary and minutes\r\n'
@@ -781,7 +852,8 @@ void main() {
   });
 
   test('ImapClient uid fetch BODY[HEADER]', () async {
-    mockServer.response = '* 123456 FETCH (BODY[HEADER] {345}\r\n'
+    mockServer.response =
+        '* 123456 FETCH (BODY[HEADER] {345}\r\n'
         'Date: Wed, 17 Jul 1996 02:23:25 -0700 (PDT)\r\n'
         'From: Terry Gray <gray@cac.washington.edu>\r\n'
         'Subject: IMAP4rev1 WG mtg summary and minutes\r\n'
@@ -895,7 +967,8 @@ void main() {
   });
 
   test('ImapClient fetch BODY[]', () async {
-    mockServer.response = '* 123456 FETCH (BODY[] {359}\r\n'
+    mockServer.response =
+        '* 123456 FETCH (BODY[] {359}\r\n'
         'Date: Wed, 17 Jul 1996 02:23:25 -0700 (PDT)\r\n'
         'From: Terry Gray <gray@cac.washington.edu>\r\n'
         'Subject: IMAP4rev1 WG mtg summary and minutes\r\n'
@@ -943,7 +1016,8 @@ void main() {
   });
 
   test('ImapClient fetch with split response', () async {
-    mockServer.response = '* 123456 FETCH (BODY[] {359}\r\n'
+    mockServer.response =
+        '* 123456 FETCH (BODY[] {359}\r\n'
         'Date: Wed, 17 Jul 1996 02:23:25 -0700 (PDT)\r\n'
         'From: Terry Gray <gray@cac.washington.edu>\r\n'
         'Subject: IMAP4rev1 WG mtg summary and minutes\r\n'
@@ -972,7 +1046,8 @@ void main() {
   });
 
   test('ImapClient fetch BODY[1]', () async {
-    mockServer.response = '* 123456 FETCH (BODY[1] {14}\r\n'
+    mockServer.response =
+        '* 123456 FETCH (BODY[1] {14}\r\n'
         '\r\nHello Word\r\n'
         ')\r\n'
         '* 123455 FETCH (BODY[1] {27}\r\n'
@@ -1000,7 +1075,8 @@ void main() {
   });
 
   Future<Mailbox> _selectInbox() {
-    mockServer.response = '* 63510 EXISTS\r\n'
+    mockServer.response =
+        '* 63510 EXISTS\r\n'
         '* 23 RECENT\r\n'
         '* FLAGS (\\Answered \\Flagged \\Deleted \\Seen \\Draft \$Forwarded \$Unsubscribed)\r\n'
         '* OK [PERMANENTFLAGS (\\Answered \\Flagged \\Draft \\Deleted \\Seen \$Forwarded \$Unsubscribed \\*)] Unlimited\r\n'
@@ -1019,7 +1095,8 @@ void main() {
     await Future.delayed(const Duration(milliseconds: 20));
     mockServer.response = '<tag> OK NOOP Completed';
     await client.noop();
-    mockServer.response = '* 2232 EXPUNGE\r\n'
+    mockServer.response =
+        '* 2232 EXPUNGE\r\n'
         '* 1234 EXPUNGE\r\n'
         '* 23 EXISTS\r\n'
         '* 3 RECENT\r\n'
@@ -1028,11 +1105,10 @@ void main() {
         '<tag> OK NOOP Completed';
     await client.noop();
     await Future.delayed(const Duration(milliseconds: 10));
-    expect(
-      expungedMessages,
-      [2232, 1234],
-      reason: 'Expunged messages should fit',
-    );
+    expect(expungedMessages, [
+      2232,
+      1234,
+    ], reason: 'Expunged messages should fit');
     expect(box.messagesExists, 23);
     expect(box.messagesRecent, 3);
     expect(fetchEvents.length, 2, reason: 'Expecting 2 fetch events');
@@ -1048,7 +1124,8 @@ void main() {
     expungedMessages.clear();
     fetchEvents.clear();
     vanishedMessages = null;
-    mockServer.response = '* VANISHED 1232:1236\r\n'
+    mockServer.response =
+        '* VANISHED 1232:1236\r\n'
         '* 233 EXISTS\r\n'
         '* 33 RECENT\r\n'
         '* 14 FETCH (FLAGS (\\Seen \\Deleted))\r\n'
@@ -1076,7 +1153,8 @@ void main() {
     await _selectInbox();
     await Future.delayed(const Duration(seconds: 1));
     expungedMessages = [];
-    mockServer.response = '* 2232 EXPUNGE\r\n'
+    mockServer.response =
+        '* 2232 EXPUNGE\r\n'
         '* 1234 EXPUNGE\r\n'
         '* VANISHED 1232:1236\r\n'
         '* 233 EXISTS\r\n'
@@ -1087,11 +1165,10 @@ void main() {
     await client.check();
 
     await Future.delayed(const Duration(milliseconds: 50));
-    expect(
-      expungedMessages,
-      [2232, 1234],
-      reason: 'Expunged messages should fit',
-    );
+    expect(expungedMessages, [
+      2232,
+      1234,
+    ], reason: 'Expunged messages should fit');
   });
 
   test('ImapClient expunge', () async {
@@ -1099,7 +1176,8 @@ void main() {
     expungedMessages = [];
     await Future.delayed(const Duration(seconds: 1));
 
-    mockServer.response = '* 3 EXPUNGE\r\n'
+    mockServer.response =
+        '* 3 EXPUNGE\r\n'
         '* 3 EXPUNGE\r\n'
         '* 23 EXPUNGE\r\n'
         '* 26 EXPUNGE\r\n'
@@ -1107,11 +1185,12 @@ void main() {
 
     await client.expunge();
     await Future.delayed(const Duration(milliseconds: 50));
-    expect(
-      expungedMessages,
-      [3, 3, 23, 26],
-      reason: 'Expunged messages should fit',
-    );
+    expect(expungedMessages, [
+      3,
+      3,
+      23,
+      26,
+    ], reason: 'Expunged messages should fit');
   });
 
   test('ImapClient uidExpunge', () async {
@@ -1119,17 +1198,17 @@ void main() {
     expungedMessages = [];
     await Future.delayed(const Duration(seconds: 1));
 
-    mockServer.response = '* 12345 EXPUNGE\r\n'
+    mockServer.response =
+        '* 12345 EXPUNGE\r\n'
         '* 12346 EXPUNGE\r\n'
         '<tag> OK UID EXPUNGE completed';
 
     await client.uidExpunge(MessageSequence.fromRange(12345, 12346));
     await Future.delayed(const Duration(milliseconds: 50));
-    expect(
-      expungedMessages,
-      [12345, 12346],
-      reason: 'Expunged messages should fit',
-    );
+    expect(expungedMessages, [
+      12345,
+      12346,
+    ], reason: 'Expunged messages should fit');
   });
 
   test('ImapClient copy', () async {
@@ -1139,6 +1218,35 @@ void main() {
       MessageSequence.fromRange(1, 3),
       targetMailboxPath: 'TRASH',
     );
+  });
+
+  test('ImapClient copy quotes a target path containing parentheses', () async {
+    // '(' and ')' are atom-specials (RFC 3501 section 9), so an unquoted
+    // `COPY 1:3 INBOX.Financial.Audit(s)` is rejected by servers with
+    // "BAD Invalid characters in atom". _encodeMailboxPath used to quote a
+    // path only when it contained a space.
+    await _selectInbox();
+    mockServer.response = '<tag> OK messages copied';
+    await client.copy(
+      MessageSequence.fromRange(1, 3),
+      targetMailboxPath: 'INBOX.Financial.Audit(s)',
+    );
+
+    expect(
+      mockServer.requests.last,
+      contains(' COPY 1:3 "INBOX.Financial.Audit(s)"'),
+    );
+  });
+
+  test('ImapClient copy encodes a non-ASCII target path', () async {
+    await _selectInbox();
+    mockServer.response = '<tag> OK messages copied';
+    await client.copy(
+      MessageSequence.fromRange(1, 3),
+      targetMailboxPath: 'Entwürfe',
+    );
+
+    expect(mockServer.requests.last, contains(' COPY 1:3 Entw&APw-rfe\r\n'));
   });
 
   test('ImapClient uid copy', () async {
@@ -1151,10 +1259,10 @@ void main() {
     );
     expect(copyResponse, isNotNull);
     expect(copyResponse.responseCodeCopyUid?.targetSequence, isNotNull);
-    expect(
-      copyResponse.responseCodeCopyUid?.targetSequence.toList(),
-      [12345, 12346],
-    );
+    expect(copyResponse.responseCodeCopyUid?.targetSequence.toList(), [
+      12345,
+      12346,
+    ]);
   });
 
   test('ImapClient move', () async {
@@ -1167,10 +1275,10 @@ void main() {
     );
     expect(moveResponse, isNotNull);
     expect(moveResponse.responseCodeCopyUid?.targetSequence, isNotNull);
-    expect(
-      moveResponse.responseCodeCopyUid?.targetSequence.toList(),
-      [12345, 12346],
-    );
+    expect(moveResponse.responseCodeCopyUid?.targetSequence.toList(), [
+      12345,
+      12346,
+    ]);
   });
 
   test('ImapClient uid move', () async {
@@ -1183,23 +1291,47 @@ void main() {
     );
     expect(moveResponse, isNotNull);
     expect(moveResponse.responseCodeCopyUid?.targetSequence, isNotNull);
-    expect(
-      moveResponse.responseCodeCopyUid?.targetSequence.toList(),
-      [12345, 12346],
-    );
+    expect(moveResponse.responseCodeCopyUid?.targetSequence.toList(), [
+      12345,
+      12346,
+    ]);
   });
+
+  test(
+    'ImapClient uid move does not encode the path of a target mailbox again',
+    () async {
+      // Mailbox.encodedPath is already modified UTF-7 (RFC 3501 section
+      // 5.1.3). Encoding it a second time turned the '&' that starts every
+      // non-ASCII run into '&-', so servers without UTF8=ACCEPT answered
+      // "NO [TRYCREATE]" for any mailbox with a non-ASCII name.
+      await _selectInbox();
+      mockServer.response =
+          '* LIST (\\HasNoChildren \\Trash) "/" "&BCMENAQwBDsEUQQ9BD0ESwQ1-"\r\n'
+          '<tag> OK LIST completed';
+      final trash = (await client.listMailboxes()).single;
+      mockServer.response = '<tag> OK UID MOVE completed';
+      await client.uidMove(
+        MessageSequence.fromRange(1, 3),
+        targetMailbox: trash,
+      );
+
+      expect(
+        mockServer.requests.last,
+        contains(' UID MOVE 1:3 "&BCMENAQwBDsEUQQ9BD0ESwQ1-"\r\n'),
+      );
+    },
+  );
 
   test('ImapClient store', () async {
     await _selectInbox();
-    mockServer.response = '* 1 FETCH (FLAGS (\\Flagged \\Seen))\r\n'
+    mockServer.response =
+        '* 1 FETCH (FLAGS (\\Flagged \\Seen))\r\n'
         '* 2 FETCH (FLAGS (\\Deleted \\Seen))\r\n'
         '* 3 FETCH (FLAGS (\\Seen))\r\n'
         '<tag> OK store completed';
-    final storeResponse = await client.store(
-      MessageSequence.fromRange(1, 3),
-      [r'\Seen'],
-      unchangedSinceModSequence: 12346,
-    );
+    final storeResponse = await client.store(MessageSequence.fromRange(1, 3), [
+      r'\Seen',
+    ], unchangedSinceModSequence: 12346);
     expect(storeResponse.changedMessages, isNotNull);
     expect(storeResponse.changedMessages, isNotEmpty);
     expect(storeResponse.changedMessages?.length, 3);
@@ -1214,13 +1346,12 @@ void main() {
   test('ImapClient store with modified sequence', () async {
     await _selectInbox();
 
-    mockServer.response = '* 5 FETCH (MODSEQ (320162350))\r\n'
+    mockServer.response =
+        '* 5 FETCH (MODSEQ (320162350))\r\n'
         '<tag> OK [MODIFIED 7,9] Conditional STORE done';
-    final storeResponse = await client.store(
-      MessageSequence.fromRange(4, 9),
-      [r'\Seen'],
-      unchangedSinceModSequence: 12345,
-    );
+    final storeResponse = await client.store(MessageSequence.fromRange(4, 9), [
+      r'\Seen',
+    ], unchangedSinceModSequence: 12345);
     expect(storeResponse.changedMessages, isNotNull);
     expect(storeResponse.changedMessages, isNotEmpty);
     expect(storeResponse.changedMessages?.length, 1);
@@ -1232,13 +1363,16 @@ void main() {
 
   test('ImapClient uid store', () async {
     await _selectInbox();
-    mockServer.response = '* 123 FETCH (UID 12342 FLAGS (\\Flagged \\Seen))\r\n'
+    mockServer.response =
+        '* 123 FETCH (UID 12342 FLAGS (\\Flagged \\Seen))\r\n'
         '* 124 FETCH (UID 12343 FLAGS (\\Deleted \\Seen))\r\n'
         '* 125 FETCH (UID 12344 FLAGS (\\Seen))\r\n'
         '<tag> OK store completed';
 
-    final storeResponse = await client
-        .uidStore(MessageSequence.fromRange(12342, 12344), [r'\Seen']);
+    final storeResponse = await client.uidStore(
+      MessageSequence.fromRange(12342, 12344),
+      [r'\Seen'],
+    );
     expect(storeResponse.changedMessages, isNotNull);
     expect(storeResponse.changedMessages, isNotEmpty);
     expect(storeResponse.changedMessages?.length, 3);
@@ -1252,12 +1386,14 @@ void main() {
 
   test('ImapClient markSeen', () async {
     await _selectInbox();
-    mockServer.response = '* 1 FETCH (FLAGS (\\Flagged \\Seen))\r\n'
+    mockServer.response =
+        '* 1 FETCH (FLAGS (\\Flagged \\Seen))\r\n'
         '* 2 FETCH (FLAGS (\\Deleted \\Seen))\r\n'
         '* 3 FETCH (FLAGS (\\Seen))\r\n'
         '<tag> OK store completed';
-    final storeResponse =
-        await client.markSeen(MessageSequence.fromRange(1, 3));
+    final storeResponse = await client.markSeen(
+      MessageSequence.fromRange(1, 3),
+    );
     expect(storeResponse.changedMessages, isNotNull);
     expect(storeResponse.changedMessages, isNotEmpty);
     expect(storeResponse.changedMessages?.length, 3);
@@ -1271,28 +1407,32 @@ void main() {
 
   test('ImapClient markFlagged', () async {
     await _selectInbox();
-    mockServer.response = '* 1 FETCH (FLAGS (\\Flagged \\Seen))\r\n'
+    mockServer.response =
+        '* 1 FETCH (FLAGS (\\Flagged \\Seen))\r\n'
         '* 2 FETCH (FLAGS (\\Deleted \\Flagged \\Seen))\r\n'
         '* 3 FETCH (FLAGS (\\Seen \\Flagged))\r\n'
         '<tag> OK store completed';
-    final storeResponse =
-        await client.markFlagged(MessageSequence.fromRange(1, 3));
+    final storeResponse = await client.markFlagged(
+      MessageSequence.fromRange(1, 3),
+    );
     expect(storeResponse.changedMessages, isNotNull);
     expect(storeResponse.changedMessages, isNotEmpty);
     expect(storeResponse.changedMessages?.length, 3);
     expect(storeResponse.changedMessages?[0].sequenceId, 1);
     expect(storeResponse.changedMessages?[0].flags, [r'\Flagged', r'\Seen']);
     expect(storeResponse.changedMessages?[1].sequenceId, 2);
-    expect(
-      storeResponse.changedMessages?[1].flags,
-      [r'\Deleted', r'\Flagged', r'\Seen'],
-    );
+    expect(storeResponse.changedMessages?[1].flags, [
+      r'\Deleted',
+      r'\Flagged',
+      r'\Seen',
+    ]);
     expect(storeResponse.changedMessages?[2].sequenceId, 3);
     expect(storeResponse.changedMessages?[2].flags, [r'\Seen', r'\Flagged']);
   });
 
   test('ImapClient enable', () async {
-    mockServer.response = '* ENABLED CONDSTORE QRESYNC\r\n'
+    mockServer.response =
+        '* ENABLED CONDSTORE QRESYNC\r\n'
         '<tag> OK Enabled Caps';
     final enabledCaps = await client.enable(['QRESYNC', 'CONDSTORE']);
     expect(enabledCaps, isNotEmpty);
@@ -1383,10 +1523,13 @@ void main() {
       'Hey,\r\nhow are things today?\r\n\r\nAll the best?',
       subject: 'Appended draft message',
     );
-    mockServer.response = '+ OK\r\n'
+    mockServer.response =
+        '+ OK\r\n'
         '<tag> OK [APPENDUID 1466002016 176] Append completed (0.068 + 0.059 + 0.051 secs).';
-    final appendResponse =
-        await client.appendMessage(message, flags: [r'\Draft', r'\Seen']);
+    final appendResponse = await client.appendMessage(
+      message,
+      flags: [r'\Draft', r'\Seen'],
+    );
     expect(appendResponse, isNotNull);
     expect(appendResponse.responseCode, isNotNull);
     expect(
@@ -1399,6 +1542,112 @@ void main() {
     expect(uidResponseCode?.targetSequence.toList().first, 176);
   });
 
+  test(
+    'ImapClient append with internalDate sends RFC 3501 date-time',
+    () async {
+      await _selectInbox();
+      final message = MessageBuilder.buildSimpleTextMessage(
+        const MailAddress('User Name', 'user.name@domain.com'),
+        [const MailAddress('Rita Recpient', 'rr@domain.com')],
+        'Hey,\r\nhow are things today?',
+        subject: 'Appended with a date',
+      );
+      mockServer.response =
+          '+ OK\r\n'
+          '<tag> OK [APPENDUID 1466002016 178] Append completed.';
+      final appendResponse = await client.appendMessage(
+        message,
+        flags: [r'\Seen'],
+        internalDate: DateTime.utc(2026, 1, 5, 10, 0, 0),
+      );
+
+      expect(
+        appendResponse.responseCodeAppendUid?.targetSequence.toList().first,
+        178,
+      );
+      expect(
+        mockServer.requests.join(),
+        contains(' APPEND "INBOX" (\\Seen) "05-Jan-2026 10:00:00 +0000" {'),
+      );
+    },
+  );
+
+  test(
+    'ImapClient append with a non-UTC internalDate is sent in UTC',
+    () async {
+      await _selectInbox();
+      mockServer.response =
+          '+ OK\r\n'
+          '<tag> OK [APPENDUID 1466002016 179] Append completed.';
+      await client.appendMessageText(
+        'Subject: tz\r\n\r\nbody',
+        internalDate: DateTime.utc(2026, 6, 30, 23, 30).toLocal(),
+      );
+
+      expect(
+        mockServer.requests.join(),
+        contains(' APPEND "INBOX" "30-Jun-2026 23:30:00 +0000" {'),
+      );
+    },
+  );
+
+  test(
+    'ImapClient append does not encode the path of a target mailbox again',
+    () async {
+      await _selectInbox();
+      mockServer.response =
+          '* LIST (\\HasNoChildren \\Sent) "/" "&BB4EQgQ,BEAEMAQyBDsENQQ9BD0ESwQ1-"\r\n'
+          '<tag> OK LIST completed';
+      final sent = (await client.listMailboxes()).single;
+      mockServer.response =
+          '+ OK\r\n'
+          '<tag> OK [APPENDUID 1466002016 180] Append completed.';
+      await client.appendMessageText(
+        'Subject: sent\r\n\r\nbody',
+        flags: [r'\Seen'],
+        targetMailbox: sent,
+      );
+
+      expect(
+        mockServer.requests.join(),
+        contains(' APPEND "&BB4EQgQ,BEAEMAQyBDsENQQ9BD0ESwQ1-" (\\Seen) {'),
+      );
+    },
+  );
+
+  // appendMessageText sends its literal through the socket's default UTF-8
+  // IOSink.write: fine for genuine text, but a byte outside 7-bit ASCII
+  // comes back out re-encoded as two bytes on the wire, corrupting an
+  // already-encoded MIME source and desyncing the `{n}` byte count declared
+  // in the command line from what is actually sent. appendMessageBytes
+  // exists for exactly that case and must reach the wire unchanged.
+  test('ImapClient appendMessageBytes sends raw bytes unchanged, including '
+      'a byte outside 7-bit ASCII', () async {
+    await _selectInbox();
+    final rawBytes = Uint8List.fromList([
+      ...'Subject: raw\r\n\r\n'.codeUnits,
+      0xE9, // outside ASCII: would double-encode if routed through UTF-8.
+      0x41,
+    ]);
+    mockServer.response =
+        '+ OK\r\n'
+        '<tag> OK [APPENDUID 1466002016 177] Append completed.';
+    final appendResponse = await client.appendMessageBytes(
+      rawBytes,
+      targetMailboxPath: 'INBOX',
+    );
+
+    expect(
+      appendResponse.responseCodeAppendUid?.targetSequence.toList().first,
+      177,
+    );
+    final sent = mockServer.requests.join();
+    expect(sent, contains(' APPEND INBOX {${rawBytes.length}}\r\n'));
+    // The mock maps each received byte to one code unit, so a byte that
+    // had been re-encoded as UTF-8 would show up here as two characters.
+    expect(sent, endsWith(String.fromCharCodes([...rawBytes, 13, 10])));
+  });
+
   test('ImapClient idle', () async {
     final box = await _selectInbox();
     expungedMessages = [];
@@ -1407,14 +1656,17 @@ void main() {
         '<tag> OK LOGIN completed';
     await client.login('testuser', 'testpassword');
 
-    mockServer.response = '+ OK IDLE started\r\n'
+    mockServer.response =
+        '+ OK IDLE started\r\n'
         '<tag> OK IDLE done';
     await client.idleStart();
 
-    unawaited(mockServer.fire(
-      const Duration(milliseconds: 100),
-      '* 2 EXPUNGE\r\n* 17 EXPUNGE\r\n* ${box.messagesExists} EXISTS\r\n',
-    ));
+    unawaited(
+      mockServer.fire(
+        const Duration(milliseconds: 100),
+        '* 2 EXPUNGE\r\n* 17 EXPUNGE\r\n* ${box.messagesExists} EXISTS\r\n',
+      ),
+    );
     await Future.delayed(const Duration(milliseconds: 200));
     await client.idleDone();
     expect(expungedMessages.length, 2);
@@ -1422,8 +1674,57 @@ void main() {
     expect(expungedMessages[1], 17);
   });
 
+  test('ImapClient idle waitForContinuation resolves on + idling', () async {
+    await _selectInbox();
+    mockServer.response =
+        '* CAPABILITY IMAP4rev1 IDLE LITERAL- AUTH=PLAIN\r\n'
+        '<tag> OK LOGIN completed';
+    await client.login('testuser', 'testpassword');
+
+    // Standard mock path: reply to IDLE with `+ idling` then a tagged OK
+    // (the OK would normally follow DONE, but for this test we just need
+    // the `+` to arrive so the waitForContinuation future resolves).
+    mockServer.response = '+ idling\r\n<tag> OK IDLE done';
+
+    final started = DateTime.now();
+    await client.idleStart(waitForContinuation: true);
+    final elapsedMs = DateTime.now().difference(started).inMilliseconds;
+
+    // The future must not resolve before the `+` arrives. In this mock
+    // setup `+` is sent synchronously when the client writes IDLE, so the
+    // elapsed time is tiny but non-negative — the key assertion is that
+    // the method call itself awaited a full write/read round-trip rather
+    // than returning instantly.
+    expect(elapsedMs >= 0, isTrue);
+
+    // Cleanup: graceful teardown of the IDLE session.
+    await client.idleDone();
+  });
+
+  test('ImapClient idle waitForContinuation fails on disconnect', () async {
+    await _selectInbox();
+    mockServer.response =
+        '* CAPABILITY IMAP4rev1 IDLE AUTH=PLAIN\r\n'
+        '<tag> OK LOGIN completed';
+    await client.login('testuser', 'testpassword');
+
+    // No continuation will ever arrive -- server stays silent.
+    mockServer.response = null;
+
+    final future = client.idleStart(waitForContinuation: true);
+    // Attach the expectation BEFORE triggering disconnect so the async
+    // error (thrown by our override) is captured rather than surfacing as
+    // an unhandled error.
+    final expectation = expectLater(future, throwsA(isA<ImapException>()));
+
+    await Future.delayed(const Duration(milliseconds: 20));
+    await client.disconnect();
+    await expectation;
+  });
+
   test('ImapClient setquota', () async {
-    mockServer.response = '* QUOTA INBOX (STORAGE 0 120 MESSAGES 0 5000)\r\n'
+    mockServer.response =
+        '* QUOTA INBOX (STORAGE 0 120 MESSAGES 0 5000)\r\n'
         '<tag> OK Quota set';
     final quotaResult = await client.setQuota(
       quotaRoot: 'INBOX',
@@ -1440,8 +1741,48 @@ void main() {
     expect(quotaResult.resourceLimits[1].usageLimit, 5000);
   });
 
+  test('ImapClient namespace', () async {
+    mockServer.response =
+        '* NAMESPACE (("" "/")) NIL (("#shared/" "/")("#public/" "/"))\r\n'
+        '<tag> OK NAMESPACE completed';
+    final result = await client.namespace();
+    expect(result, isNotNull);
+    expect(result!.personal.length, 1);
+    expect(result.personal[0].prefix, '');
+    expect(result.personal[0].delimiter, '/');
+    expect(result.otherUsers, isEmpty);
+    expect(result.shared.length, 2);
+    expect(result.shared[0].prefix, '#shared/');
+    expect(result.shared[1].prefix, '#public/');
+    expect(result.shared[1].delimiter, '/');
+  });
+
+  test('ImapClient namespace with a literal prefix', () async {
+    mockServer.response =
+        '* NAMESPACE (("" "/")) NIL (({8}\r\n'
+        '#shared/ "/"))\r\n'
+        '<tag> OK NAMESPACE completed';
+    final result = await client.namespace();
+    expect(result, isNotNull);
+    expect(result!.shared.length, 1);
+    expect(result.shared[0].prefix, '#shared/');
+    expect(result.shared[0].delimiter, '/');
+  });
+
+  test('ImapClient namespace without a NAMESPACE response', () async {
+    mockServer.response = '<tag> OK completed';
+    final result = await client.namespace();
+    expect(result, isNull);
+  });
+
+  test('ImapClient namespace not supported', () async {
+    mockServer.response = '<tag> BAD Unknown command';
+    expect(client.namespace(), throwsA(isA<ImapException>()));
+  });
+
   test('ImapClient getquota', () async {
-    mockServer.response = '* QUOTA INBOX (STORAGE 100 1000 TRASH 3 10)\r\n'
+    mockServer.response =
+        '* QUOTA INBOX (STORAGE 100 1000 TRASH 3 10)\r\n'
         '<tag> OK Quota set';
     final quotaResult = await client.getQuota(quotaRoot: 'INBOX');
     expect(quotaResult.rootName, 'INBOX');
@@ -1455,7 +1796,8 @@ void main() {
   });
 
   test('ImapClient getquotaroot', () async {
-    mockServer.response = '* QUOTAROOT INBOX "User quota"\r\n'
+    mockServer.response =
+        '* QUOTAROOT INBOX "User quota"\r\n'
         '* QUOTA "User quota" (STORAGE 232885 1048576)\r\n'
         '<tag> OK Quota set';
     final quotaRootResult = await client.getQuotaRoot(mailboxName: 'INBOX');

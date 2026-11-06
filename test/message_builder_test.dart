@@ -8,6 +8,7 @@ import 'package:enough_mail/src/message_builder.dart';
 import 'package:enough_mail/src/mime_data.dart';
 import 'package:enough_mail/src/mime_message.dart';
 import 'package:test/test.dart';
+
 // cSpell:disable
 
 void main() {
@@ -233,9 +234,7 @@ END:VCARD\r
           MediaSubtype.imageJpeg.mediaType,
           filename: 'helloworld.jpg',
         )
-        ..setRecommendedTextEncoding(
-          supports8BitMessages: true,
-        );
+        ..setRecommendedTextEncoding(supports8BitMessages: true);
       final message = builder.buildMimeMessage();
       final rendered = message.renderMessage();
       // print(rendered);
@@ -456,9 +455,10 @@ END:VCARD\r
       // print('original:');
       // print(originalMessage.renderMessage());
 
-      final replyBuilder =
-          MessageBuilder.prepareReplyToMessage(originalMessage, to.first)
-            ..text = 'Here is my reply';
+      final replyBuilder = MessageBuilder.prepareReplyToMessage(
+        originalMessage,
+        to.first,
+      )..text = 'Here is my reply';
       final message = replyBuilder.buildMimeMessage();
       // print('reply:');
       // print(message.renderMessage());
@@ -473,7 +473,7 @@ END:VCARD\r
       );
       expect(
         message.getHeaderValue('cc'),
-        '"=?utf8?Q?One_m=C3=B6re?=" <one.more@domain.com>',
+        '=?UTF-8?Q?One_m=C3=B6re?= <one.more@domain.com>',
       );
       expect(
         message.getHeaderValue('Content-Type'),
@@ -597,7 +597,7 @@ END:VCARD\r
       );
       expect(
         message.getHeaderValue('cc'),
-        '"=?utf8?Q?One_m=C3=B6re?=" <one.more@domain.com>',
+        '=?UTF-8?Q?One_m=C3=B6re?= <one.more@domain.com>',
       );
       expect(
         message.getHeaderValue('Content-Type'),
@@ -615,8 +615,8 @@ END:VCARD\r
       const expectedEnd = 'sentence is finished.\r\n>';
       expect(
         message.decodeContentText()?.substring(
-              (message.decodeContentText()?.length ?? 0) - expectedEnd.length,
-            ),
+          (message.decodeContentText()?.length ?? 0) - expectedEnd.length,
+        ),
         expectedEnd,
       );
     });
@@ -665,7 +665,7 @@ END:VCARD\r
       );
       expect(
         message.getHeaderValue('cc'),
-        '"=?utf8?Q?One_m=C3=B6re?=" <one.more@domain.com>',
+        '=?UTF-8?Q?One_m=C3=B6re?= <one.more@domain.com>',
       );
       expect(
         message.getHeaderContentType()?.mediaType.sub,
@@ -705,9 +705,10 @@ END:VCARD\r
       // print('original:');
       // print(originalMessage.renderMessage());
 
-      final replyBuilder =
-          MessageBuilder.prepareReplyToMessage(originalMessage, from)
-            ..text = 'Here is my reply';
+      final replyBuilder = MessageBuilder.prepareReplyToMessage(
+        originalMessage,
+        from,
+      )..text = 'Here is my reply';
       final message = replyBuilder.buildMimeMessage();
       expect(
         message.getHeaderValue('from'),
@@ -716,7 +717,7 @@ END:VCARD\r
       expect(message.getHeaderValue('to'), '"Me" <recipient@domain.com>');
       expect(
         message.getHeaderValue('cc'),
-        '"=?utf8?Q?One_m=C3=B6re?=" <one.more@domain.com>',
+        '=?UTF-8?Q?One_m=C3=B6re?= <one.more@domain.com>',
       );
     });
 
@@ -747,7 +748,7 @@ END:VCARD\r
       expect(message.getHeaderValue('to'), '"Me" <recipient@domain.com>');
       expect(
         message.getHeaderValue('cc'),
-        '"=?utf8?Q?One_m=C3=B6re?=" <one.more@domain.com>',
+        '=?UTF-8?Q?One_m=C3=B6re?= <one.more@domain.com>',
       );
       expect(
         message.getHeaderValue('from'),
@@ -782,7 +783,7 @@ END:VCARD\r
       expect(message.getHeaderValue('to'), '"Me" <recipient@domain.com>');
       expect(
         message.getHeaderValue('cc'),
-        '"=?utf8?Q?One_m=C3=B6re?=" <one.more@domain.com>',
+        '=?UTF-8?Q?One_m=C3=B6re?= <one.more@domain.com>',
       );
       expect(
         message.getHeaderValue('from'),
@@ -827,7 +828,7 @@ END:VCARD\r
       );
       expect(
         message.getHeaderValue('cc'),
-        '"=?utf8?Q?One_m=C3=B6re?=" <one.more@domain.com>',
+        '=?UTF-8?Q?One_m=C3=B6re?= <one.more@domain.com>',
       );
     });
 
@@ -868,7 +869,7 @@ END:VCARD\r
       );
       expect(
         message.getHeaderValue('cc'),
-        '"=?utf8?Q?One_m=C3=B6re?=" <one.more@domain.com>',
+        '=?UTF-8?Q?One_m=C3=B6re?= <one.more@domain.com>',
       );
     });
   });
@@ -918,7 +919,8 @@ END:VCARD\r
         message.getHeaderValue('Content-Transfer-Encoding'),
         'quoted-printable',
       );
-      const expectedStart = 'This should be interesting:\r\n'
+      const expectedStart =
+          'This should be interesting:\r\n'
           '>---------- Original Message ----------\r\n'
           '>From: "Personal Name" <sender@domain.com>\r\n'
           '>To: "Me" <recipient@domain.com>\r\n'
@@ -981,7 +983,8 @@ END:VCARD\r
         message.getHeaderContentType()?.mediaType.sub,
         MediaSubtype.multipartAlternative,
       );
-      const expectedStart = 'This should be interesting:\r\n'
+      const expectedStart =
+          'This should be interesting:\r\n'
           '>---------- Original Message ----------\r\n'
           '>From: "Personal Name" <sender@domain.com>\r\n'
           '>To: "Me" <recipient@domain.com>\r\n'
@@ -995,7 +998,8 @@ END:VCARD\r
         expectedEnd,
       );
       //expect(message.getHeaderValue('Content-Transfer-Encoding'), '8bit');
-      const expectedStart2 = '<p>This should be interesting:</p>\r\n'
+      const expectedStart2 =
+          '<p>This should be interesting:</p>\r\n'
           '<br/><blockquote>---------- Original Message ----------<br/>\r\n'
           'From: "Personal Name" <sender@domain.com><br/>\r\n'
           'To: "Me" <recipient@domain.com><br/>\r\n'
@@ -1061,7 +1065,8 @@ END:VCARD\r
         message.getHeaderContentType()?.mediaType.sub,
         MediaSubtype.multipartAlternative,
       );
-      const expectedStart = 'This should be interesting:\r\n'
+      const expectedStart =
+          'This should be interesting:\r\n'
           '>---------- Original Message ----------\r\n'
           '>From: "Personal Name" <sender@domain.com>\r\n'
           '>To: "Me" <recipient@domain.com>\r\n'
@@ -1074,7 +1079,8 @@ END:VCARD\r
         expectedEnd,
       );
       //expect(message.getHeaderValue('Content-Transfer-Encoding'), '8bit');
-      const expectedStart2 = '<p>This should be interesting:</p>\r\n'
+      const expectedStart2 =
+          '<p>This should be interesting:</p>\r\n'
           '<br/><blockquote>---------- Original Message ----------<br/>\r\n'
           'From: "Personal Name" <sender@domain.com><br/>\r\n'
           'To: "Me" <recipient@domain.com><br/>\r\n'
@@ -1108,13 +1114,14 @@ END:VCARD\r
       const text =
           'Hello World - here\s some text that should spans two lines in the '
           'end when this sentence is finished.\r\n';
-      final originalBuilder = MessageBuilder.prepareMessageWithMediaType(
-        MediaSubtype.multipartMixed,
-      )
-        ..from = [from]
-        ..to = to
-        ..cc = cc
-        ..subject = subject;
+      final originalBuilder =
+          MessageBuilder.prepareMessageWithMediaType(
+              MediaSubtype.multipartMixed,
+            )
+            ..from = [from]
+            ..to = to
+            ..cc = cc
+            ..subject = subject;
       originalBuilder.addPart(mediaSubtype: MediaSubtype.multipartAlternative)
         ..addTextPlain(text)
         ..addTextHtml('<p>$text</p>');
@@ -1123,14 +1130,16 @@ END:VCARD\r
       final originalMessage = originalBuilder.buildMimeMessage();
       // print('original:');
       // print(originalMessage.renderMessage());
-      final forwardBuilder = MessageBuilder.prepareForwardMessage(
-        originalMessage,
-        from: to.first,
-        quoteMessage: false,
-      )..to = [
-          const MailAddress('First', 'first@domain.com'),
-          const MailAddress('Second', 'second@domain.com'),
-        ];
+      final forwardBuilder =
+          MessageBuilder.prepareForwardMessage(
+              originalMessage,
+              from: to.first,
+              quoteMessage: false,
+            )
+            ..to = [
+              const MailAddress('First', 'first@domain.com'),
+              const MailAddress('Second', 'second@domain.com'),
+            ];
       // ..addTextPlain(text)
       // ..addTextHtml('<p>$text</p>');
 
@@ -1368,11 +1377,13 @@ END:VCARD\r
       expect(filled.substring(0, 3), 'On ');
       expect(filled.substring(filled.length - ' wrote:'.length), ' wrote:');
       expect(
-        filled.substring(filled.length -
-            ' "Personal Name" <sender@domain.com> wrote:'.length),
+        filled.substring(
+          filled.length - ' "Personal Name" <sender@domain.com> wrote:'.length,
+        ),
         ' "Personal Name" <sender@domain.com> wrote:',
       );
-      template = '---------- Original Message ----------\r\n'
+      template =
+          '---------- Original Message ----------\r\n'
           'From: <from>\r\n'
           '[[to To: <to>\r\n]]'
           '[[cc CC: <cc>\r\n]]'
@@ -1413,8 +1424,9 @@ END:VCARD\r
   group('mailto', () {
     test('adddress, subject, body', () {
       const from = MailAddress('Me', 'me@domain.com');
-      final mailto =
-          Uri.parse('mailto:recpient@domain.com?subject=hello&body=world');
+      final mailto = Uri.parse(
+        'mailto:recpient@domain.com?subject=hello&body=world',
+      );
       final builder = MessageBuilder.prepareMailtoBasedMessage(mailto, from);
       final message = builder.buildMimeMessage();
       expect(message.getHeaderValue('subject'), 'hello');
@@ -1434,8 +1446,9 @@ END:VCARD\r
 
     test('to, subject, body', () {
       const from = MailAddress('Me', 'me@domain.com');
-      final mailto =
-          Uri.parse('mailto:?to=recpient@domain.com&subject=hello&body=world');
+      final mailto = Uri.parse(
+        'mailto:?to=recpient@domain.com&subject=hello&body=world',
+      );
       final builder = MessageBuilder.prepareMailtoBasedMessage(mailto, from);
       final message = builder.buildMimeMessage();
       expect(message.getHeaderValue('subject'), 'hello');
@@ -1444,9 +1457,10 @@ END:VCARD\r
     });
     test('address & to, subject, body', () {
       const from = MailAddress('Me', 'me@domain.com');
-      final mailto =
-          Uri.parse('mailto:recpient@domain.com?to=another@domain.com&'
-              'subject=hello&body=world');
+      final mailto = Uri.parse(
+        'mailto:recpient@domain.com?to=another@domain.com&'
+        'subject=hello&body=world',
+      );
       final builder = MessageBuilder.prepareMailtoBasedMessage(mailto, from);
       final message = builder.buildMimeMessage();
       expect(message.getHeaderValue('subject'), 'hello');
@@ -1466,7 +1480,7 @@ END:VCARD\r
       );
       final builder = MessageBuilder.prepareMailtoBasedMessage(mailto, from);
       final message = builder.buildMimeMessage();
-      expect(message.getHeaderValue('subject'), 'hello w=?utf8?Q?=C3=B6?=rld');
+      expect(message.getHeaderValue('subject'), 'hello w=?UTF-8?Q?=C3=B6?=rld');
       expect(message.getHeaderValue('to'), 'recpient@domain.com');
       expect(message.getHeaderValue('cc'), 'another@domain.com');
       expect(message.decodeContentText(), 'let me unsubscribe');
@@ -1590,8 +1604,10 @@ END:VCARD\r
         ..to = to
         ..subject = 'Original Message'
         ..addTextPlain('Hello World - this is the original message')
-        ..addTextHtml('<html><body><p>Hello World - this is the original '
-            'message</p></body></html>')
+        ..addTextHtml(
+          '<html><body><p>Hello World - this is the original '
+          'message</p></body></html>',
+        )
         ..addBinary(
           Uint8List.fromList([1, 2, 3, 4, 5, 6, 7, 8, 9, 0]),
           MediaSubtype.applicationOctetStream.mediaType,
@@ -1619,10 +1635,18 @@ END:VCARD\r
         'Hello World - this is the original message\r\n',
       );
       expect(embeddedMessage?.parts?.length, 3);
-      expect(
-        embeddedMessage?.parts?[2].decodeContentBinary(),
-        [1, 2, 3, 4, 5, 6, 7, 8, 9, 0],
-      );
+      expect(embeddedMessage?.parts?[2].decodeContentBinary(), [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        0,
+      ]);
     });
 
     test('real world test', () {
@@ -1636,10 +1660,10 @@ END:VCARD\r
         ..addMessagePart(original)
         ..subject = 'message with attached message';
       builder.getPart(MediaSubtype.multipartAlternative, recursive: false) ??
-          builder.addPart(
-            mediaSubtype: MediaSubtype.multipartAlternative,
-            insert: true,
-          )
+            builder.addPart(
+              mediaSubtype: MediaSubtype.multipartAlternative,
+              insert: true,
+            )
         ..addTextPlain('hello world')
         ..addTextHtml('<p>hello world</p>');
       final message = builder.buildMimeMessage();
@@ -1671,10 +1695,17 @@ END:VCARD\r
         embeddedMessage?.parts?[1].decodeFileName(),
         'Rechnung_2021_01_27317621000841.pdf',
       );
-      expect(
-        embeddedMessage?.parts?[1].decodeContentBinary()?.sublist(0, 9),
-        [37, 80, 68, 70, 45, 49, 46, 53, 10],
-      );
+      expect(embeddedMessage?.parts?[1].decodeContentBinary()?.sublist(0, 9), [
+        37,
+        80,
+        68,
+        70,
+        45,
+        49,
+        46,
+        53,
+        10,
+      ]);
       final parsedAgain = MimeMessage.parseFromText(message.renderMessage());
       final parsedAgainEmbedded = parsedAgain.parts?[1].decodeContentMessage();
       expect(
@@ -1700,19 +1731,51 @@ END:VCARD\r
         originalMessage.fromEmail,
       );
       const finalRecipient = MailAddress('My Name', 'recipient@domain.com');
-      final mdn =
-          MessageBuilder.buildReadReceipt(originalMessage, finalRecipient);
+      final mdn = MessageBuilder.buildReadReceipt(
+        originalMessage,
+        finalRecipient,
+      );
       // print(mdn.renderMessage());
       expect(mdn.to, isNotEmpty);
       expect(mdn.to?.first.email, originalMessage.fromEmail);
       expect(mdn.mediaType.sub, MediaSubtype.multipartReport);
       expect(mdn.decodeTextPlainPart(), isNotEmpty);
       expect(mdn.decodeSubject(), isNotNull);
-      final part = mdn
-          .getPartWithMediaSubtype(MediaSubtype.messageDispositionNotification);
+      final part = mdn.getPartWithMediaSubtype(
+        MediaSubtype.messageDispositionNotification,
+      );
       expect(part, isNotNull);
       //print(part?.decodeContentText());
       //expect(part?.decodeDispositionNotification())
+    });
+  });
+
+  group('performance', () {
+    test('buildMimeMessage should be fast with 100KB body', () {
+      final builder = MessageBuilder.prepareMultipartAlternativeMessage()
+        ..from = [const MailAddress('Sender', 'sender@example.com')]
+        ..to = [const MailAddress('Recipient', 'recipient@example.com')]
+        ..subject = 'Large body perf test';
+
+      final largeBody = 'A' * (100 * 1024);
+
+      builder.addTextPlain(largeBody);
+
+      final sw = Stopwatch()..start();
+      final mime = builder.buildMimeMessage();
+      sw.stop();
+
+      // Sanity checks
+      expect(mime, isNotNull);
+      expect(mime.renderMessage().length, greaterThan(100000));
+
+      expect(
+        sw.elapsedMilliseconds,
+        lessThan(1000),
+        reason:
+            'buildMimeMessage() should complete in <1s, but currently '
+            'takes ${sw.elapsedMilliseconds}ms for a 100KB body. ',
+      );
     });
   });
 }

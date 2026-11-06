@@ -2,12 +2,14 @@ import 'dart:convert';
 
 import 'package:enough_mail/src/codecs/mail_codec.dart';
 import 'package:test/test.dart';
+
 // cSpell:disable
 
 void main() {
   group('Base64 decoding', () {
     test('encoding.iso-8859-1 base64 directly repeated', () {
-      const input = '=?ISO-8859-1?B?SWYgeW91IGNhbiByZWFkIHRoaXMgeW8=?==?ISO-'
+      const input =
+          '=?ISO-8859-1?B?SWYgeW91IGNhbiByZWFkIHRoaXMgeW8=?==?ISO-'
           '8859-2?B?dSB1bmRlcnN0YW5kIHRoZSBleGFtcGxlLg==?=';
       expect(
         MailCodec.decodeHeader(input),
@@ -39,7 +41,10 @@ void main() {
     });
     test('encodeHeader.base64 with UTF8 input', () {
       const input = 'Hello Wörld';
-      expect(MailCodec.base64.encodeHeader(input), 'Hello W=?utf8?B?w7Y=?=rld');
+      expect(
+        MailCodec.base64.encodeHeader(input),
+        'Hello W=?UTF-8?B?w7Y=?=rld',
+      );
       // counter test:
       expect(
         MailCodec.decodeHeader('Hello W=?utf8?B?w7Y=?=rld'),

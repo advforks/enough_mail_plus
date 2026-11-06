@@ -13,6 +13,14 @@ class ClientConfig {
   /// The list of email providers
   List<ConfigEmailProvider>? emailProviders;
 
+  /// `true` when this configuration was retrieved over an unprotected
+  /// connection, e.g. plain `http://autoconfig.<domain>/`.
+  ///
+  /// Such a configuration may have been tampered with and can point to
+  /// servers under the control of an attacker. Applications should show it
+  /// to the user for confirmation before submitting any credentials.
+  bool isFromInsecureSource = false;
+
   /// Checks if the client configuration is not valid
   bool get isNotValid {
     final emailProviders = this.emailProviders;
@@ -36,12 +44,40 @@ class ClientConfig {
   ServerConfig? get preferredIncomingServer => emailProviders?.isEmpty ?? true
       ? null
       : emailProviders?.first.preferredIncomingServer;
+  set preferredIncomingServer(ServerConfig? server) {
+    emailProviders?.first.preferredIncomingServer = server;
+  }
+
+  /// Replaces every preferred server that does not use an SSL/TLS socket
+  /// from the start by its SSL variant on the standard port
+  /// (IMAP 993, POP 995, SMTP 465).
+  void enforceSecureSockets() {
+    ServerConfig? secure(ServerConfig? config) {
+      if (config == null || config.isSecureSocket) {
+        return config;
+      }
+      final port = switch (config.type) {
+        ServerType.imap => 993,
+        ServerType.pop => 995,
+        ServerType.smtp => 465,
+        _ => config.port,
+      };
+
+      return config.copyWith(port: port, socketType: SocketType.ssl);
+    }
+
+    preferredIncomingImapServer = secure(preferredIncomingImapServer);
+    preferredIncomingPopServer = secure(preferredIncomingPopServer);
+    preferredIncomingServer = secure(preferredIncomingServer);
+    preferredOutgoingSmtpServer = secure(preferredOutgoingSmtpServer);
+    preferredOutgoingServer = secure(preferredOutgoingServer);
+  }
 
   /// The preferred incoming IMAP-compatible mail server
   ServerConfig? get preferredIncomingImapServer =>
       emailProviders?.isEmpty ?? true
-          ? null
-          : emailProviders?.first.preferredIncomingImapServer;
+      ? null
+      : emailProviders?.first.preferredIncomingImapServer;
   set preferredIncomingImapServer(ServerConfig? server) {
     emailProviders?.first.preferredIncomingImapServer = server;
   }
@@ -49,8 +85,8 @@ class ClientConfig {
   /// The preferred incoming POP-compatible mail server
   ServerConfig? get preferredIncomingPopServer =>
       emailProviders?.isEmpty ?? true
-          ? null
-          : emailProviders?.first.preferredIncomingPopServer;
+      ? null
+      : emailProviders?.first.preferredIncomingPopServer;
   set preferredIncomingPopServer(ServerConfig? server) {
     emailProviders?.first.preferredIncomingPopServer = server;
   }
@@ -66,8 +102,8 @@ class ClientConfig {
   /// The preferred outgoing SMTP-compatible mail server
   ServerConfig? get preferredOutgoingSmtpServer =>
       emailProviders?.isEmpty ?? true
-          ? null
-          : emailProviders?.first.preferredOutgoingSmtpServer;
+      ? null
+      : emailProviders?.first.preferredOutgoingSmtpServer;
   set preferredOutgoingSmtpServer(ServerConfig? server) {
     emailProviders?.first.preferredOutgoingSmtpServer = server;
   }
@@ -89,10 +125,12 @@ class ConfigEmailProvider {
     this.incomingServers,
     this.outgoingServers,
   }) {
-    preferredIncomingServer =
-        (incomingServers?.isEmpty ?? true) ? null : incomingServers?.first;
-    preferredOutgoingServer =
-        (outgoingServers?.isEmpty ?? true) ? null : outgoingServers?.first;
+    preferredIncomingServer = (incomingServers?.isEmpty ?? true)
+        ? null
+        : incomingServers?.first;
+    preferredOutgoingServer = (outgoingServers?.isEmpty ?? true)
+        ? null
+        : outgoingServers?.first;
   }
 
   /// ID of the provider
@@ -268,13 +306,13 @@ class ServerConfig {
 
   /// Creates a new server configuration with the default values
   const ServerConfig.empty()
-      : type = ServerType.unknown,
-        hostname = '',
-        port = 0,
-        socketType = SocketType.unknown,
-        authentication = Authentication.unknown,
-        usernameType = UsernameType.unknown,
-        authenticationAlternative = null;
+    : type = ServerType.unknown,
+      hostname = '',
+      port = 0,
+      socketType = SocketType.unknown,
+      authentication = Authentication.unknown,
+      usernameType = UsernameType.unknown,
+      authenticationAlternative = null;
 
   /// Creates a new [ServerConfig] from the given [json]
   factory ServerConfig.fromJson(Map<String, dynamic> json) =>
@@ -331,7 +369,8 @@ class ServerConfig {
   bool get isSecureSocket => socketType == SocketType.ssl;
 
   @override
-  String toString() => '$typeName:\n host: $hostname\n port: $port\n socket: '
+  String toString() =>
+      '$typeName:\n host: $hostname\n port: $port\n socket: '
       '$socketTypeName\n authentication: $authenticationName\n'
       'username: $username';
 
@@ -347,10 +386,9 @@ class ServerConfig {
         if (lastAtIndex == -1) {
           return email;
         }
-        return email.substring(lastAtIndex + 1);
+        return email.substring(0, lastAtIndex);
       case UsernameType.realName:
       case UsernameType.unknown:
-      default:
         return null;
     }
   }
@@ -385,17 +423,16 @@ class ServerConfig {
     Authentication? authentication,
     Authentication? authenticationAlternative,
     UsernameType? usernameType,
-  }) =>
-      ServerConfig(
-        type: type ?? this.type,
-        hostname: hostname ?? this.hostname,
-        port: port ?? this.port,
-        socketType: socketType ?? this.socketType,
-        authentication: authentication ?? this.authentication,
-        authenticationAlternative:
-            authenticationAlternative ?? this.authenticationAlternative,
-        usernameType: usernameType ?? this.usernameType,
-      );
+  }) => ServerConfig(
+    type: type ?? this.type,
+    hostname: hostname ?? this.hostname,
+    port: port ?? this.port,
+    socketType: socketType ?? this.socketType,
+    authentication: authentication ?? this.authentication,
+    authenticationAlternative:
+        authenticationAlternative ?? this.authenticationAlternative,
+    usernameType: usernameType ?? this.usernameType,
+  );
 
   static String _usernameTypeToText(UsernameType? type) {
     String text;

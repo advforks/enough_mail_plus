@@ -3,11 +3,11 @@ import 'dart:io';
 import 'package:enough_mail/enough_mail.dart';
 import 'package:enough_mail/src/private/smtp/smtp_command.dart';
 import 'package:enough_mail/src/private/util/client_base.dart';
-import 'package:event_bus/event_bus.dart';
 import 'package:test/test.dart';
 
 import '../mock_socket.dart';
 import 'mock_smtp_server.dart';
+
 // cSpell:disable
 
 late SmtpClient client;
@@ -22,22 +22,24 @@ void main() {
     final envVars = Platform.environment;
     _isLogEnabled = envVars['SMTP_LOG'] == 'true';
 
-    client = SmtpClient(
-      'enough.de',
-      bus: EventBus(sync: true),
-      isLogEnabled: _isLogEnabled,
-    );
+    client = SmtpClient('enough.de', isLogEnabled: _isLogEnabled);
 
     _smtpUser = 'testuser';
     _smtpPassword = 'testpassword';
     final connection = MockConnection();
     client.connect(
       connection.socketClient,
-      connectionInformation:
-          const ConnectionInfo('dummy.domain.com', 587, isSecure: true),
+      connectionInformation: const ConnectionInfo(
+        'dummy.domain.com',
+        587,
+        isSecure: true,
+      ),
     );
-    _mockServer =
-        MockSmtpServer(connection.socketServer, _smtpUser, _smtpPassword);
+    _mockServer = MockSmtpServer(
+      connection.socketServer,
+      _smtpUser,
+      _smtpPassword,
+    );
     _mockServer.writeln('220 domain.com ESMTP Postfix');
 
     //   capResponse = await client.login("testuser", "testpassword");
@@ -46,7 +48,8 @@ void main() {
   });
 
   test('SmtpClient EHLO', () async {
-    _mockServer.nextResponse = '250-domain.com Hello\r\n'
+    _mockServer.nextResponse =
+        '250-domain.com Hello\r\n'
         '250-PIPELINING\r\n'
         '250-SIZE 200000000\r\n'
         '250-ETRN\r\n'
@@ -68,6 +71,31 @@ void main() {
     expect(client.serverInfo.supports('NOTTHERE'), isFalse);
   });
 
+  test('SmtpClient EHLO with bare reply code', () async {
+    // RFC 5321 section 4.2: the last reply line may consist of the code only
+    _mockServer.nextResponse = '250-domain.com Hello\r\n250';
+    final response = await client.ehlo();
+    expect(response.type, SmtpResponseType.success);
+    expect(response.code, 250);
+    expect(response.message, isEmpty);
+  });
+
+  test('SmtpClient AUTH XOAUTH2 with bare 334 challenge', () async {
+    // smtp.yandex.ru answers `AUTH XOAUTH2` (sent without an initial
+    // response) with an empty challenge written as `334<CRLF>` - no space
+    _mockServer.responses.addAll([
+      '334',
+      '235 2.7.0 Authentication successful',
+    ]);
+    final response = await client.authenticate(
+      'user@example.com',
+      'access-token',
+      AuthMechanism.xoauth2,
+    );
+    expect(response.type, SmtpResponseType.success);
+    expect(response.code, 235);
+  });
+
   test('SmtpClient login', () async {
     _mockServer.nextResponse = '235 2.7.0 Authentication successful';
     final response = await client.authenticate(_smtpUser, _smtpPassword);
@@ -76,8 +104,10 @@ void main() {
   });
 
   test('SmtpClient sendMessage', () async {
-    const from =
-        MailAddress('Rita Levi-Montalcini', 'Rita.Levi-Montalcini@domain.com');
+    const from = MailAddress(
+      'Rita Levi-Montalcini',
+      'Rita.Levi-Montalcini@domain.com',
+    );
     const to = [
       MailAddress('Rosalind Franklin', 'Rosalind.Franklin@domain.com'),
     ];
@@ -93,8 +123,10 @@ void main() {
   });
 
   test('SmtpClient sendBdatMessage', () async {
-    const from =
-        MailAddress('Rita Levi-Montalcini', 'Rita.Levi-Montalcini@domain.com');
+    const from = MailAddress(
+      'Rita Levi-Montalcini',
+      'Rita.Levi-Montalcini@domain.com',
+    );
     const to = [
       MailAddress('Rosalind Franklin', 'Rosalind.Franklin@domain.com'),
     ];
@@ -104,8 +136,10 @@ void main() {
       'Today as well.\r\nOne more time:\r\nHello from enough_mail!',
       subject: 'enough_mail hello',
     );
-    final response =
-        await client.sendChunkedMessage(message, supportUnicode: false);
+    final response = await client.sendChunkedMessage(
+      message,
+      supportUnicode: false,
+    );
     expect(response.type, SmtpResponseType.success);
     expect(response.code, 250);
   });
@@ -118,8 +152,9 @@ void main() {
 
   test('SmtpClient with exception', () async {
     try {
-      final response =
-          await client.sendCommand(DummySmtpCommand('example', client));
+      final response = await client.sendCommand(
+        DummySmtpCommand('example', client),
+      );
       fail('sendCommand should throw. (but got: $response)');
     } catch (e) {
       expect(e, isA<SmtpException>());

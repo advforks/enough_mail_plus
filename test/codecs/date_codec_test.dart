@@ -10,7 +10,7 @@ void main() {
     test('encodeDate for UTC DateTime', () {
       expect(
         DateCodec.encodeDate(DateTime.utc(2022, 1, 7, 22, 18)),
-        'Fri, 07 Jan 2022 22:18:00 -0000',
+        'Fri, 07 Jan 2022 22:18:00 +0000',
       );
     });
     test('encodeDate for DateTime east of Greenwich', () {
@@ -23,14 +23,9 @@ void main() {
     });
     test('encodeDate for DateTime west of Greenwich', () {
       expect(
-        DateCodec.encodeDate(tz.TZDateTime(
-          tz.getLocation('America/Panama'),
-          2022,
-          1,
-          7,
-          22,
-          18,
-        )),
+        DateCodec.encodeDate(
+          tz.TZDateTime(tz.getLocation('America/Panama'), 2022, 1, 7, 22, 18),
+        ),
         'Fri, 07 Jan 2022 22:18:00 -0500',
       );
     });

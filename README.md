@@ -1,3 +1,5 @@
+# enough_mail
+
 IMAP, POP3 and SMTP clients for Dart and Flutter email developers.
 
 Available under the commercial friendly 
@@ -7,15 +9,23 @@ Available under the commercial friendly
 ## Installation
 Add this dependency your pubspec.yaml file:
 
-```
+```yaml
 dependencies:
-  enough_mail: ^2.1.7
+  enough_mail: ^3.0.0
 ```
-The latest version or `enough_mail` is [![enough_mail version](https://img.shields.io/pub/v/enough_mail.svg)](https://pub.dartlang.org/packages/enough_mail).
 
+Or for bleeding edge, use git directly:
+```yaml
+dependencies:
+  enough_mail: 
+    git:
+      url: https://github.com/Enough-Software/enough_mail.git
+
+```
 
 ## API Documentation
 Check out the full API documentation at https://pub.dev/documentation/enough_mail/latest/
+
 
 ## High Level API Usage
 
@@ -299,6 +309,7 @@ The following IMAP extensions are supported:
 * ✅ [QRESYNC](https://tools.ietf.org/html/rfc7162) 
 * ✅ [ENABLE](https://tools.ietf.org/html/rfc5161)
 * ✅ [QUOTA](https://tools.ietf.org/html/rfc2087)
+* ✅ [NAMESPACE](https://tools.ietf.org/html/rfc2342)
 * ✅ [IMAP Support for UTF-8](https://tools.ietf.org/html/rfc6855) 
 * ✅ [ESEARCH](https://tools.ietf.org/html/rfc4731)
 * ✅ [SORT and THREAD](https://tools.ietf.org/html/rfc5256)

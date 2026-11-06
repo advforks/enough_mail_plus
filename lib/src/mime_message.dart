@@ -1,5 +1,6 @@
 // ignore_for_file: avoid_returning_this
 
+import 'dart:convert';
 import 'dart:typed_data';
 
 import 'package:collection/collection.dart' show IterableExtension;
@@ -33,6 +34,7 @@ class MimePart {
   List<MimePart>? parts;
 
   bool _isParsed = false;
+  bool _headersModified = false;
   String? _decodedText;
   DateTime? _decodedDate;
   ContentTypeHeader? _contentTypeHeader;
@@ -107,15 +109,20 @@ class MimePart {
     var localValue = value;
     if (value != null) {
       if (encoding == HeaderEncoding.Q) {
-        localValue = MailCodec.quotedPrintable
-            .encodeHeader(value, nameLength: name.length);
+        localValue = MailCodec.quotedPrintable.encodeHeader(
+          value,
+          nameLength: name.length,
+        );
       } else if (encoding == HeaderEncoding.B) {
-        localValue =
-            MailCodec.base64.encodeHeader(value, nameLength: name.length);
+        localValue = MailCodec.base64.encodeHeader(
+          value,
+          nameLength: name.length,
+        );
       }
     }
     final header = Header(name, localValue, encoding);
     headers?.add(header);
+    _headersModified = true;
   }
 
   /// Sets a header with the specified [name], [value] and optional [encoding],
@@ -132,14 +139,19 @@ class MimePart {
     var localValue = value;
     if (value != null) {
       if (encoding == HeaderEncoding.Q) {
-        localValue = MailCodec.quotedPrintable
-            .encodeHeader(value, nameLength: name.length);
+        localValue = MailCodec.quotedPrintable.encodeHeader(
+          value,
+          nameLength: name.length,
+        );
       } else if (encoding == HeaderEncoding.B) {
-        localValue =
-            MailCodec.base64.encodeHeader(value, nameLength: name.length);
+        localValue = MailCodec.base64.encodeHeader(
+          value,
+          nameLength: name.length,
+        );
       }
     }
     headers?.add(Header(name, localValue, encoding));
+    _headersModified = true;
   }
 
   /// Removes the header with the specified [name].
@@ -147,6 +159,7 @@ class MimePart {
     headers ??= <Header>[];
     final lowerCaseName = name.toLowerCase();
     headers?.removeWhere((h) => h.lowerCaseName == lowerCaseName);
+    _headersModified = true;
   }
 
   /// Inserts the [part] at the beginning of all parts.
@@ -223,8 +236,8 @@ class MimePart {
           final partFetchId = mediaType.sub == MediaSubtype.messageRfc822
               ? fetchId
               : fetchId != null
-                  ? '$fetchId.${i + 1}'
-                  : '${i + 1}';
+              ? '$fetchId.${i + 1}'
+              : '${i + 1}';
           part.collectContentInfo(
             disposition,
             result,
@@ -272,14 +285,14 @@ class MimePart {
 
   /// Decodes the text of this part.
   String? decodeContentText() => _decodedText ??= mimeData?.decodeText(
-        getHeaderContentType(),
-        _getLowerCaseHeaderValue('content-transfer-encoding'),
-      );
+    getHeaderContentType(),
+    _getLowerCaseHeaderValue('content-transfer-encoding'),
+  );
 
   /// Decodes the binary data of this part.
   Uint8List? decodeContentBinary() => mimeData?.decodeBinary(
-        _getLowerCaseHeaderValue('content-transfer-encoding'),
-      );
+    _getLowerCaseHeaderValue('content-transfer-encoding'),
+  );
 
   /// Decodes a message/rfc822 part
   MimeMessage? decodeContentMessage() {
@@ -408,6 +421,13 @@ class MimePart {
     final parts = part.parts;
     if (parts != null) {
       for (final childPart in parts) {
+        // the text of an attached or forwarded message is not the text of
+        // this message, and neither is an attached text file
+        if (childPart.mediaType.isMessage ||
+            childPart.getHeaderContentDisposition()?.disposition ==
+                ContentDisposition.attachment) {
+          continue;
+        }
         final decoded = _decodeTextPart(childPart, subtype);
         if (decoded != null) {
           return decoded;
@@ -421,6 +441,7 @@ class MimePart {
   /// Parses this and all children MIME parts.
   void parse() {
     _isParsed = true;
+    _headersModified = false;
     final mimeData = this.mimeData;
     final parts = this.parts;
     if (mimeData != null) {
@@ -457,11 +478,13 @@ class MimePart {
   void render(StringBuffer buffer, {bool renderHeader = true}) {
     final mimeData = this.mimeData;
     if (mimeData != null) {
-      if (!mimeData.containsHeader && renderHeader) {
+      if ((!mimeData.containsHeader || _headersModified) && renderHeader) {
         _renderHeaders(buffer);
         buffer.write('\r\n');
       }
-      mimeData.render(buffer);
+      // If headers have been modified, skip rendering headers from mimeData
+      final renderDataHeader = !_headersModified || !mimeData.containsHeader;
+      mimeData.render(buffer, renderHeader: renderDataHeader);
     } else {
       if (renderHeader) {
         _renderHeaders(buffer);
@@ -471,8 +494,10 @@ class MimePart {
       if (parts != null && parts.isNotEmpty) {
         final multiPartBoundary = getHeaderContentType()?.boundary;
         if (multiPartBoundary == null) {
-          throw InvalidArgumentException('mime message rendering error: '
-              'parts present but no multiPartBoundary defined.');
+          throw InvalidArgumentException(
+            'mime message rendering error: '
+            'parts present but no multiPartBoundary defined.',
+          );
         }
         for (final part in parts) {
           buffer
@@ -597,9 +622,14 @@ class MimeMessage extends MimePart {
     this.guid = guid;
   }
 
-  int? xGmThrid; // X-GM-THRID
-  int? xGmMsgid; // X-GM-MSGID
-  List<String>? xGmLabels; // X-GM-LABELS
+  /// The Gmail thread ID (X-GM-THRID)
+  int? xGmThrid;
+
+  /// The Gmail message ID (X-GM-MSGID)
+  int? xGmMsgid;
+
+  /// The Gmail labels (X-GM-LABELS)
+  List<String>? xGmLabels;
 
   /// The modifications sequence of this message.
   ///
@@ -684,9 +714,11 @@ class MimeMessage extends MimePart {
 
     return !isReadReceiptSent &&
         (mimeHeaders != null &&
-            mimeHeaders.any((h) =>
-                h.lowerCaseName == 'disposition-notification-to' ||
-                h.lowerCaseName == 'return-receipt-to'));
+            mimeHeaders.any(
+              (h) =>
+                  h.lowerCaseName == 'disposition-notification-to' ||
+                  h.lowerCaseName == 'return-receipt-to',
+            ));
   }
 
   /// Checks if this message contents has been downloaded
@@ -699,8 +731,9 @@ class MimeMessage extends MimePart {
     if (from != null && from.isNotEmpty) {
       return from.first.email;
     } else if (headers != null) {
-      final fromHeaderValue =
-          headers?.firstWhereOrNull((h) => h.lowerCaseName == 'from')?.value;
+      final fromHeaderValue = headers
+          ?.firstWhereOrNull((h) => h.lowerCaseName == 'from')
+          ?.value;
       if (fromHeaderValue != null) {
         return ParserHelper.parseEmail(fromHeaderValue);
       }
@@ -1039,8 +1072,9 @@ class MimeMessage extends MimePart {
     if (hasAttachments()) {
       return true;
     } else {
-      final inlineParts =
-          findContentInfo(disposition: ContentDisposition.inline);
+      final inlineParts = findContentInfo(
+        disposition: ContentDisposition.inline,
+      );
       for (final info in inlineParts) {
         if (!info.isText) {
           return true;
@@ -1082,8 +1116,10 @@ class MimeMessage extends MimePart {
     for (final id in idParts) {
       if (id == null) {
         if (!warningGiven) {
-          print('Warning: unable to retrieve individual parts from '
-              'fetchId [$fetchId] (in MimeMessage.getPart(fetchId)).');
+          print(
+            'Warning: unable to retrieve individual parts from '
+            'fetchId [$fetchId] (in MimeMessage.getPart(fetchId)).',
+          );
           warningGiven = true;
         }
         continue;
@@ -1105,8 +1141,9 @@ class MimeMessage extends MimePart {
     if (match == null) {
       final partsByFetchId = _individualParts;
       if (partsByFetchId != null) {
-        match = partsByFetchId.values
-            .firstWhereOrNull((p) => p.mediaType.sub == subtype);
+        match = partsByFetchId.values.firstWhereOrNull(
+          (p) => p.mediaType.sub == subtype,
+        );
       }
     }
 
@@ -1123,8 +1160,9 @@ class MimeMessage extends MimePart {
       final partsByFetchId = _individualParts;
       final structure = body;
       if (partsByFetchId != null && structure != null) {
-        final alternativeBodyPart =
-            structure.findFirst(MediaSubtype.multipartAlternative);
+        final alternativeBodyPart = structure.findFirst(
+          MediaSubtype.multipartAlternative,
+        );
         if (alternativeBodyPart != null) {
           final matchBodyPart = alternativeBodyPart.findFirst(subtype);
           if (matchBodyPart != null) {
@@ -1187,7 +1225,7 @@ class MimeMessage extends MimePart {
     final allParts = allPartsFlat;
     for (final part in allParts) {
       final partCid = part._getLowerCaseHeaderValue('content-id');
-      if (partCid != null && partCid.toLowerCase() == cid) {
+      if (partCid != null && partCid.toLowerCase() == contentId) {
         return part;
       }
     }
@@ -1327,8 +1365,26 @@ class MimeMessage extends MimePart {
 /// Encapsulates a MIME header
 class Header {
   /// Creates a new header
-  Header(this.name, this.value, [this.encoding = HeaderEncoding.none])
-      : lowerCaseName = name.toLowerCase();
+  ///
+  /// Line breaks in [name] and [value] are replaced by a single space, so
+  /// that a header value can neither start another header nor terminate the
+  /// header section (header injection). Folding is applied in [render].
+  Header(String name, String? value, [this.encoding = HeaderEncoding.none])
+    : name = sanitize(name),
+      value = value == null ? null : sanitize(value),
+      lowerCaseName = sanitize(name).toLowerCase();
+
+  static final _lineBreakPattern = RegExp(r'[\r\n]+[ \t]*');
+
+  /// Replaces every line break in [text], including the folding white space
+  /// that follows it, with a single space.
+  static String sanitize(String text) {
+    if (!text.contains('\r') && !text.contains('\n')) {
+      return text;
+    }
+
+    return text.replaceAll(_lineBreakPattern, ' ');
+  }
 
   /// The name of the header
   final String name;
@@ -1345,53 +1401,109 @@ class Header {
   @override
   String toString() => '$name: $value';
 
+  static final _encodedWordPattern = RegExp(r'=\?[^?]*\?[^?]*\?[^?]*\?=');
+
   /// Renders this header into a the [buffer] wrapping it if necessary.
   void render(StringBuffer buffer) {
     final value = this.value;
-    var length = name.length + ': '.length + (value?.length ?? 0);
-    buffer
-      ..write(name)
-      ..write(': ');
-    if (value == null || length < MailConventions.textLineMaxLength) {
-      if (value != null) {
-        buffer.write(value);
-      }
-      buffer.write('\r\n');
+    if (value == null) {
+      buffer
+        ..write(name)
+        ..write(': \r\n');
 
       return;
     }
+    // RFC 2047: an encoded word must not be split by folding
+    final encodedWords = value.contains('=?')
+        ? _encodedWordPattern
+              .allMatches(value)
+              .map((match) => (match.start, match.end))
+              .toList()
+        : const <(int, int)>[];
+    bool isInsideEncodedWord(int index) =>
+        encodedWords.any((range) => index >= range.$1 && index < range.$2 - 1);
+    final totalLength = value.length;
     var currentLineLength = name.length + ': '.length;
-    length -= name.length + ': '.length;
-    final runes = value.runes.toList();
+    buffer
+      ..write(name)
+      ..write(': ');
+    if (currentLineLength + totalLength < MailConventions.textLineMaxLength) {
+      buffer
+        ..write(value)
+        ..write('\r\n');
+
+      return;
+    }
     var startIndex = 0;
-    while (length > 0) {
+    while (startIndex < totalLength) {
       var chunkLength = MailConventions.textLineMaxLength - currentLineLength;
-      if (startIndex + chunkLength >= value.length) {
+      if (startIndex + chunkLength >= totalLength) {
         // write reminder:
         buffer
           ..write(value.substring(startIndex).trim())
           ..write('\r\n');
         break;
       }
-      for (var runeIndex = startIndex + chunkLength;
-          runeIndex > startIndex;
-          runeIndex--) {
-        final rune = runes[runeIndex];
-        if (rune == AsciiRunes.runeSemicolon ||
-            rune == AsciiRunes.runeSpace ||
-            rune == AsciiRunes.runeClosingParentheses ||
-            rune == AsciiRunes.runeClosingBracket ||
-            rune == AsciiRunes.runeGreaterThan) {
-          chunkLength = runeIndex - startIndex + 1;
+      var foundFoldingPoint = false;
+      for (var i = startIndex + chunkLength; i > startIndex; i--) {
+        if (isInsideEncodedWord(i)) {
+          continue;
+        }
+        final char = value.codeUnitAt(i);
+        if (char == AsciiRunes.runeSemicolon ||
+            char == AsciiRunes.runeSpace ||
+            char == AsciiRunes.runeClosingParentheses ||
+            char == AsciiRunes.runeClosingBracket ||
+            char == AsciiRunes.runeGreaterThan ||
+            char == AsciiRunes.runeComma) {
+          chunkLength = i - startIndex + 1;
+          foundFoldingPoint = true;
           break;
+        }
+      }
+      if (!foundFoldingPoint) {
+        // try to find a folding point after chunkLength
+        // up to messageLineMaxLength
+        for (var i = startIndex + chunkLength + 1; i < totalLength; i++) {
+          if (currentLineLength + (i - startIndex) >=
+              MailConventions.messageLineMaxLength) {
+            chunkLength = i - startIndex;
+            // avoid splitting surrogate pairs
+            if (chunkLength > 0 &&
+                value.codeUnitAt(startIndex + chunkLength - 1) >= 0xD800 &&
+                value.codeUnitAt(startIndex + chunkLength - 1) <= 0xDBFF) {
+              chunkLength--;
+            }
+            break;
+          }
+          if (isInsideEncodedWord(i)) {
+            continue;
+          }
+          final char = value.codeUnitAt(i);
+          if (char == AsciiRunes.runeSemicolon ||
+              char == AsciiRunes.runeSpace ||
+              char == AsciiRunes.runeClosingParentheses ||
+              char == AsciiRunes.runeClosingBracket ||
+              char == AsciiRunes.runeGreaterThan ||
+              char == AsciiRunes.runeComma) {
+            chunkLength = i - startIndex + 1;
+            foundFoldingPoint = true;
+            break;
+          }
+        }
+        if (!foundFoldingPoint && startIndex + chunkLength < totalLength) {
+          // check if we can just take the rest of the string if it's under 998:
+          if (currentLineLength + (totalLength - startIndex) <
+              MailConventions.messageLineMaxLength) {
+            chunkLength = totalLength - startIndex;
+          }
         }
       }
       buffer
         ..write(value.substring(startIndex, startIndex + chunkLength).trim())
         ..write('\r\n');
-      length -= chunkLength;
       startIndex += chunkLength;
-      if (length > 0) {
+      if (startIndex < totalLength) {
         buffer.writeCharCode(AsciiRunes.runeTab);
         currentLineLength = 1;
       }
@@ -1520,8 +1632,9 @@ class BodyPart {
         }
       }
 
-      return parent
-          ._getFetchId(tail == null ? fetchIdPart : '$fetchIdPart.$tail');
+      return parent._getFetchId(
+        tail == null ? fetchIdPart : '$fetchIdPart.$tail',
+      );
     } else {
       return tail;
     }
@@ -1555,12 +1668,13 @@ class BodyPart {
               contentDisposition?.disposition != disposition &&
               contentType?.mediaType.top != MediaToptype.multipart)) {
         if (!withCleanParts || (withCleanParts && !fetchId.endsWith('.TEXT'))) {
-          final info = ContentInfo(
-            withCleanParts ? fetchId.replaceAll('.TEXT', '') : fetchId,
-          )
-            ..contentDisposition = contentDisposition
-            ..contentType = contentType
-            ..cid = cid;
+          final info =
+              ContentInfo(
+                  withCleanParts ? fetchId.replaceAll('.TEXT', '') : fetchId,
+                )
+                ..contentDisposition = contentDisposition
+                ..contentType = contentType
+                ..cid = cid;
           result.add(info);
         }
       }
@@ -1743,21 +1857,115 @@ class Envelope {
 /// A parameter that may contain additional parameters
 class ParameterizedHeader {
   /// Creates a new header with the given [rawValue]
+  ///
+  /// Parameters are separated at `;` outside of quoted strings, so a quoted
+  /// value such as `filename="a;b.txt"` stays intact. RFC 2231 parameter
+  /// continuations (`name*0=`, `name*1=`) and character set encoded values
+  /// (`name*=utf-8''%E2%82%AC.txt`) are decoded into the plain parameter.
   ParameterizedHeader(this.rawValue) {
-    final elements = rawValue.split(';');
-    value = elements[0];
+    final elements = _splitParameters(rawValue);
+    value = elements.first.trim();
+    final sections = <String, Map<int, String>>{};
+    final charsets = <String, String?>{};
     for (var i = 1; i < elements.length; i++) {
       final element = elements[i].trim();
+      if (element.isEmpty) {
+        continue;
+      }
       final splitPos = element.indexOf('=');
       if (splitPos == -1) {
         parameters[element.toLowerCase()] = '';
+        continue;
+      }
+      var name = element.substring(0, splitPos).trim().toLowerCase();
+      var value = removeQuotes(element.substring(splitPos + 1).trim());
+      final isEncoded = name.endsWith('*');
+      if (isEncoded) {
+        name = name.substring(0, name.length - 1);
+      }
+      int? section;
+      final sectionStart = name.lastIndexOf('*');
+      if (sectionStart != -1) {
+        section = int.tryParse(name.substring(sectionStart + 1));
+        if (section != null) {
+          name = name.substring(0, sectionStart);
+        }
+      }
+      if (isEncoded) {
+        var charset = charsets[name];
+        if (section == null || section == 0) {
+          // the first section carries charset'language'value
+          final charsetEnd = value.indexOf("'");
+          final languageEnd = charsetEnd == -1
+              ? -1
+              : value.indexOf("'", charsetEnd + 1);
+          if (languageEnd != -1) {
+            charset = value.substring(0, charsetEnd);
+            charsets[name] = charset;
+            value = value.substring(languageEnd + 1);
+          }
+        }
+        value = _decodeRfc2231Value(value, charset);
+      }
+      if (section != null) {
+        (sections[name] ??= <int, String>{})[section] = value;
       } else {
-        final name = element.substring(0, splitPos).toLowerCase();
-        final value = element.substring(splitPos + 1);
-        final valueWithoutQuotes = removeQuotes(value);
-        parameters[name] = valueWithoutQuotes;
+        parameters[name] = value;
       }
     }
+    for (final entry in sections.entries) {
+      final indices = entry.value.keys.toList()..sort();
+      parameters[entry.key] = [
+        for (final index in indices) entry.value[index]!,
+      ].join();
+    }
+  }
+
+  /// Splits [text] at every `;` that is not part of a quoted string.
+  static List<String> _splitParameters(String text) {
+    final result = <String>[];
+    var isInQuotes = false;
+    var isEscaped = false;
+    var start = 0;
+    for (var i = 0; i < text.length; i++) {
+      final code = text.codeUnitAt(i);
+      if (isEscaped) {
+        isEscaped = false;
+      } else if (isInQuotes && code == AsciiRunes.runeBackslash) {
+        isEscaped = true;
+      } else if (code == AsciiRunes.runeDoubleQuote) {
+        isInQuotes = !isInQuotes;
+      } else if (code == AsciiRunes.runeSemicolon && !isInQuotes) {
+        result.add(text.substring(start, i));
+        start = i + 1;
+      }
+    }
+    result.add(text.substring(start));
+
+    return result;
+  }
+
+  /// Percent-decodes an RFC 2231 [value] and converts it from [charset].
+  static String _decodeRfc2231Value(String value, String? charset) {
+    final bytes = <int>[];
+    for (var i = 0; i < value.length; i++) {
+      final code = value.codeUnitAt(i);
+      if (code == 37 /* % */ && i + 2 < value.length) {
+        final byte = int.tryParse(value.substring(i + 1, i + 3), radix: 16);
+        if (byte != null) {
+          bytes.add(byte);
+          i += 2;
+          continue;
+        }
+      }
+      bytes.addAll(utf8.encode(value[i]));
+    }
+
+    return MailCodec.decodeAsText(
+      Uint8List.fromList(bytes),
+      '8bit',
+      charset ?? 'utf-8',
+    );
   }
 
   /// The raw value of the header
@@ -1911,7 +2119,7 @@ enum ContentDisposition {
   attachment,
 
   /// The disposition could not be recognized
-  other
+  other,
 }
 
 /// Specifies the content disposition header of a mime part.
@@ -1951,11 +2159,13 @@ class ContentDispositionHeader extends ParameterizedHeader {
     this.modificationDate,
     this.readDate,
     this.size,
-  }) : super(disposition == ContentDisposition.inline
-            ? 'inline'
-            : disposition == ContentDisposition.attachment
-                ? 'attachment'
-                : 'unsupported') {
+  }) : super(
+         disposition == ContentDisposition.inline
+             ? 'inline'
+             : disposition == ContentDisposition.attachment
+             ? 'attachment'
+             : 'unsupported',
+       ) {
     dispositionText = disposition.name;
   }
 
@@ -1967,13 +2177,13 @@ class ContentDispositionHeader extends ParameterizedHeader {
     DateTime? readDate,
     int? size,
   }) : this.from(
-          ContentDisposition.inline,
-          filename: filename,
-          creationDate: creationDate,
-          modificationDate: modificationDate,
-          readDate: readDate,
-          size: size,
-        );
+         ContentDisposition.inline,
+         filename: filename,
+         creationDate: creationDate,
+         modificationDate: modificationDate,
+         readDate: readDate,
+         size: size,
+       );
 
   /// Convenience method to create a `Content-Disposition: attachment` header
   ContentDispositionHeader.attachment({
@@ -1983,13 +2193,13 @@ class ContentDispositionHeader extends ParameterizedHeader {
     DateTime? readDate,
     int? size,
   }) : this.from(
-          ContentDisposition.attachment,
-          filename: filename,
-          creationDate: creationDate,
-          modificationDate: modificationDate,
-          readDate: readDate,
-          size: size,
-        );
+         ContentDisposition.attachment,
+         filename: filename,
+         creationDate: creationDate,
+         modificationDate: modificationDate,
+         readDate: readDate,
+         size: size,
+       );
 
   /// The disposition as text
   late String dispositionText;
@@ -2023,13 +2233,16 @@ class ContentDispositionHeader extends ParameterizedHeader {
     if (size != null) {
       renderField('size', size.toString(), buffer);
     }
-    renderRemainingFields(buffer, exclude: [
-      'filename',
-      'creation-date',
-      'modification-date',
-      'read-date',
-      'size',
-    ]);
+    renderRemainingFields(
+      buffer,
+      exclude: [
+        'filename',
+        'creation-date',
+        'modification-date',
+        'read-date',
+        'size',
+      ],
+    );
 
     return buffer.toString();
   }
@@ -2079,8 +2292,8 @@ class ContentInfo {
 
   /// The file name
   String? get fileName => _decodedFileName ??= MailCodec.decodeHeader(
-        contentDisposition?.filename ?? contentType?.parameters['name'],
-      );
+    contentDisposition?.filename ?? contentType?.parameters['name'],
+  );
 
   /// The size of the associated message part in bytes
   int? get size => contentDisposition?.size;
@@ -2126,15 +2339,17 @@ class MimeThread {
   /// Creates a new thread from the given [sequence]
   /// with the pre-fetched [messages].
   MimeThread(this.sequence, this.messages)
-      : ids = sequence.toList(),
-        assert(
-            messages.isNotEmpty,
-            'each thread requires at least one message entry, check the '
-            'messages argument, which is empty'),
-        assert(
-            sequence.isNotEmpty,
-            'each thread requires at least one sequence entry, check the '
-            'sequence argument, which is empty');
+    : ids = sequence.toList(),
+      assert(
+        messages.isNotEmpty,
+        'each thread requires at least one message entry, check the '
+        'messages argument, which is empty',
+      ),
+      assert(
+        sequence.isNotEmpty,
+        'each thread requires at least one sequence entry, check the '
+        'sequence argument, which is empty',
+      );
 
   /// The full sequence for this thread
   final MessageSequence sequence;
@@ -2163,9 +2378,11 @@ class MimeThread {
     }
     final isUid = sequence.isUidSequence;
     final missingIds = ids
-        .where((id) => messages.any(
-              (message) => isUid ? message.uid == id : message.sequenceId == id,
-            ))
+        .where(
+          (id) => messages.any(
+            (message) => isUid ? message.uid == id : message.sequenceId == id,
+          ),
+        )
         .toList();
     final missing = MessageSequence.fromIds(missingIds, isUid: isUid);
 

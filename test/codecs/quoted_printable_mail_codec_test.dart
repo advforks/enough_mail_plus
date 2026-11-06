@@ -2,6 +2,7 @@ import 'dart:convert' as convert;
 
 import 'package:enough_mail/src/codecs/mail_codec.dart';
 import 'package:test/test.dart';
+
 // cSpell:disable
 
 void main() {
@@ -55,7 +56,8 @@ void main() {
     });
 
     test('encoding.UTF-8.QuotedPrintable with line break', () {
-      const input = 'Viele Gr</span>=C3=BC=C3=9Fe</p=\r\n'
+      const input =
+          'Viele Gr</span>=C3=BC=C3=9Fe</p=\r\n'
           '>';
       expect(
         MailCodec.quotedPrintable.decodeText(input, convert.utf8),
@@ -66,8 +68,10 @@ void main() {
     test('encoding latin1.QuotedPrintable', () {
       const input = 'jeden Tag =E4ndern k=F6nnen';
       expect(
-        MailCodec.quotedPrintable
-            .decodeText(input, const convert.Latin1Codec()),
+        MailCodec.quotedPrintable.decodeText(
+          input,
+          const convert.Latin1Codec(),
+        ),
         'jeden Tag ändern können',
       );
     });
@@ -82,12 +86,18 @@ void main() {
       const input = 'Hello Wörld';
       expect(
         MailCodec.quotedPrintable.encodeHeader(input),
-        'Hello W=?utf8?Q?=C3=B6?=rld',
+        'Hello W=?UTF-8?Q?=C3=B6?=rld',
       );
       // counter test:
       expect(
         MailCodec.decodeHeader('Hello W=?UTF8?Q?=C3=B6?=rld'),
         'Hello Wörld',
+      );
+    });
+    test('encodeHeader for a phrase always encodes and escapes specials', () {
+      expect(
+        MailCodec.quotedPrintable.encodeHeader('a.b c', isPhrase: true),
+        '=?UTF-8?Q?a=2Eb_c?=',
       );
     });
 
@@ -150,8 +160,11 @@ void main() {
         test('Decode space', () {
           const input = 'Keith_Moore';
           expect(
-            MailCodec.quotedPrintable
-                .decodeText(input, convert.utf8, isHeader: true),
+            MailCodec.quotedPrintable.decodeText(
+              input,
+              convert.utf8,
+              isHeader: true,
+            ),
             'Keith Moore',
           );
         });
@@ -177,5 +190,119 @@ void main() {
         });
       },
     );
+  });
+
+  // decodeData is the attachment path: no charset, just the bytes. It used to
+  // return `part.codeUnits` undecoded, and MailCodec.decodeBinary had no
+  // quoted-printable entry to route here at all, so a quoted-printable
+  // attachment was saved as its own source text: `=25PDF=2D1=2E7` where the
+  // caller asked for `%PDF-1.7`.
+  group('Quoted Printable binary decoding', () {
+    test('decodes hex escapes to bytes', () {
+      expect(MailCodec.quotedPrintable.decodeData('=25PDF=2D1=2E7'), <int>[
+        0x25,
+        0x50,
+        0x44,
+        0x46,
+        0x2D,
+        0x31,
+        0x2E,
+        0x37,
+      ]);
+    });
+
+    test('keeps bytes above 0x7F that a charset decode would mangle', () {
+      expect(MailCodec.quotedPrintable.decodeData('=FF=FE=00'), <int>[
+        0xFF,
+        0xFE,
+        0x00,
+      ]);
+    });
+
+    test('drops soft line breaks', () {
+      expect(MailCodec.quotedPrintable.decodeData('ab=\r\ncd'), <int>[
+        0x61,
+        0x62,
+        0x63,
+        0x64,
+      ]);
+    });
+
+    test('passes literal characters through', () {
+      expect(MailCodec.quotedPrintable.decodeData('a b'), <int>[
+        0x61,
+        0x20,
+        0x62,
+      ]);
+    });
+
+    test('leaves an invalid escape alone rather than dropping data', () {
+      expect(MailCodec.quotedPrintable.decodeData('=ZZ'), <int>[
+        0x3D,
+        0x5A,
+        0x5A,
+      ]);
+    });
+
+    test('a trailing = has no hex digits to consume', () {
+      expect(MailCodec.quotedPrintable.decodeData('ab='), <int>[
+        0x61,
+        0x62,
+        0x3D,
+      ]);
+    });
+
+    test('decodeBinary routes quoted-printable here', () {
+      expect(MailCodec.decodeBinary('=25PDF', 'quoted-printable'), <int>[
+        0x25,
+        0x50,
+        0x44,
+        0x46,
+      ]);
+      expect(MailCodec.decodeBinary('=25PDF', 'Q'), <int>[
+        0x25,
+        0x50,
+        0x44,
+        0x46,
+      ]);
+    });
+
+    test('decodeBinary knows 7bit, which it used to fall through on', () {
+      expect(MailCodec.decodeBinary('plain', '7bit'), <int>[
+        0x70,
+        0x6C,
+        0x61,
+        0x69,
+        0x6E,
+      ]);
+    });
+  });
+
+  group('malformed truncated =XY escapes are preserved verbatim', () {
+    // Regression: a '=' within two characters of the end used to throw
+    // RangeError from substring(i+1, i+3). Per RFC 2045 §6.7 consumers may
+    // preserve the malformed tail; matches the existing behaviour for
+    // non-hex '=XY' where the raw text is written to the buffer.
+    test('trailing bare "="', () {
+      expect(
+        MailCodec.quotedPrintable.decodeText('hello=', convert.utf8),
+        'hello=',
+      );
+    });
+    test('trailing "=A"', () {
+      expect(
+        MailCodec.quotedPrintable.decodeText('hello=A', convert.utf8),
+        'hello=A',
+      );
+    });
+    test('lone "=A" at end of a short input', () {
+      expect(MailCodec.quotedPrintable.decodeText('h=A', convert.utf8), 'h=A');
+    });
+    test('valid multi-byte escape followed by truncated "=A"', () {
+      expect(
+        MailCodec.quotedPrintable.decodeText('hi=C3=B6=A', convert.utf8),
+        'hiö=A',
+      );
+    });
   });
 }

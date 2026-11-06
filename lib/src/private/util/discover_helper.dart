@@ -23,10 +23,10 @@ class DiscoverHelper {
   /// Determines the user name from the given [email] address and [config]
   static String getUserName(ServerConfig config, String email) =>
       (config.usernameType == UsernameType.emailAddress)
-          ? email
-          : (config.usernameType == UsernameType.unknown)
-              ? config.username
-              : getLocalPartFromEmail(email);
+      ? email
+      : (config.usernameType == UsernameType.unknown)
+      ? config.username
+      : getLocalPartFromEmail(email);
 
   /// Automatically discovers mail configuration from sub-domain
   ///
@@ -37,26 +37,34 @@ class DiscoverHelper {
     bool isLogEnabled = false,
   }) async {
     domain ??= getDomainFromEmail(emailAddress);
-    var url =
-        'https://autoconfig.$domain/mail/config-v1.1.xml?emailaddress=$emailAddress';
+    final path =
+        '/mail/config-v1.1.xml'
+        '?emailaddress=${Uri.encodeQueryComponent(emailAddress)}';
+    var url = 'https://autoconfig.$domain$path';
     if (isLogEnabled) {
       print('Discover: trying $url');
     }
-    var response = await HttpHelper.httpGet(url, connectionTimeout: _timeout);
+    var isFromInsecureSource = false;
+    var response = await HttpHelper.httpGet(url, timeout: _timeout);
     if (_isInvalidAutoConfigResponse(response)) {
-      url = // try insecure lookup:
-          'http://autoconfig.$domain/mail/config-v1.1.xml?emailaddress=$emailAddress';
+      // try insecure lookup, the result is flagged accordingly:
+      url = 'http://autoconfig.$domain$path';
+      isFromInsecureSource = true;
       if (isLogEnabled) {
         print('Discover: trying $url');
       }
-      response = await HttpHelper.httpGet(url, connectionTimeout: _timeout);
+      response = await HttpHelper.httpGet(url, timeout: _timeout);
       if (_isInvalidAutoConfigResponse(response)) {
         return null;
       }
     }
     final text = response.text;
+    if (text == null || text.isEmpty) {
+      return null;
+    }
 
-    return text == null || text.isEmpty ? null : parseClientConfig(text);
+    return parseClientConfig(text)
+      ?..isFromInsecureSource = isFromInsecureSource;
   }
 
   static bool _isInvalidAutoConfigResponse(HttpResult response) {
@@ -95,18 +103,23 @@ class DiscoverHelper {
     //       'mx for [$domain]: ${mxRecord.name}=${mxRecord.data}  '
     //       '- rType=${mxRecord.rType}');
     // }
-    var mxDomain = mxRecords.first;
-    final dotIndex = mxDomain.indexOf('.');
-    if (dotIndex == -1) {
+    // the record data is `<priority> <host>`, the host usually but not
+    // always ends with a dot, e.g. `10 mx.example.com.`
+    var mxHost = mxRecords.first.trim();
+    if (mxHost.endsWith('.')) {
+      mxHost = mxHost.substring(0, mxHost.length - 1);
+    }
+    final spaceIndex = mxHost.lastIndexOf(' ');
+    if (spaceIndex != -1) {
+      mxHost = mxHost.substring(spaceIndex + 1);
+    }
+    // remove the host name, keep the domain:
+    final dotIndex = mxHost.indexOf('.');
+    if (dotIndex == -1 || dotIndex == mxHost.length - 1) {
       return null;
     }
-    final lastDotIndex = mxDomain.lastIndexOf('.');
-    if (lastDotIndex <= dotIndex - 1) {
-      return null;
-    }
-    mxDomain = mxDomain.substring(dotIndex + 1, lastDotIndex);
 
-    return mxDomain;
+    return mxHost.substring(dotIndex + 1);
   }
 
   /// Automatically discovers mail configuration from Mozilla ISP DB
@@ -121,7 +134,7 @@ class DiscoverHelper {
     if (isLogEnabled) {
       print('Discover: trying $url');
     }
-    final response = await HttpHelper.httpGet(url, connectionTimeout: _timeout);
+    final response = await HttpHelper.httpGet(url, timeout: _timeout);
     //print('got response ${response.statusCode}');
     if (response.statusCode != 200) {
       return null;
@@ -161,12 +174,19 @@ class DiscoverHelper {
       futures.add(_tryToConnect(info, isLogEnabled));
     }
     final results = await Future.wait(futures);
-    final imapInfo =
-        results.firstWhereOrNull((info) => info.ready(ServerType.imap));
-    final popInfo =
-        results.firstWhereOrNull((info) => info.ready(ServerType.pop));
-    final smtpInfo =
-        results.firstWhereOrNull((info) => info.ready(ServerType.smtp));
+    // the sockets were only opened to check the reachability:
+    for (final info in results) {
+      info.socket?.destroy();
+    }
+    final imapInfo = results.firstWhereOrNull(
+      (info) => info.ready(ServerType.imap),
+    );
+    final popInfo = results.firstWhereOrNull(
+      (info) => info.ready(ServerType.pop),
+    );
+    final smtpInfo = results.firstWhereOrNull(
+      (info) => info.ready(ServerType.smtp),
+    );
     if ((imapInfo == null && popInfo == null) || (smtpInfo == null)) {
       print(
         'failed to find settings for $baseDomain: '
@@ -180,14 +200,16 @@ class DiscoverHelper {
     final preferredIncomingInfo = (imapInfo != null && imapInfo.isSecure)
         ? imapInfo
         : (popInfo != null && popInfo.isSecure)
-            ? popInfo
-            : imapInfo ?? popInfo.toValueOrThrow('failed to find settings');
+        ? popInfo
+        : imapInfo ?? popInfo.toValueOrThrow('failed to find settings');
     if (isLogEnabled) {
       print('');
       print('found mail server for $baseDomain:');
-      print('incoming: ${preferredIncomingInfo.host}:'
-          '${preferredIncomingInfo.port} '
-          '(${preferredIncomingInfo.serverType})');
+      print(
+        'incoming: ${preferredIncomingInfo.host}:'
+        '${preferredIncomingInfo.port} '
+        '(${preferredIncomingInfo.serverType})',
+      );
       print(
         'outgoing: ${smtpInfo.host}:${smtpInfo.port} '
         '(${smtpInfo.serverType})',
@@ -197,8 +219,9 @@ class DiscoverHelper {
       hostname: preferredIncomingInfo.host,
       port: preferredIncomingInfo.port,
       type: preferredIncomingInfo.serverType,
-      socketType:
-          preferredIncomingInfo.isSecure ? SocketType.ssl : SocketType.starttls,
+      socketType: preferredIncomingInfo.isSecure
+          ? SocketType.ssl
+          : SocketType.starttls,
       usernameType: UsernameType.unknown,
       authentication: Authentication.unknown,
     );
@@ -213,18 +236,20 @@ class DiscoverHelper {
     final config = ClientConfig(version: '1')
       ..emailProviders = [
         ConfigEmailProvider(
-          displayName: baseDomain,
-          domains: [baseDomain],
-          displayShortName: baseDomain,
-          id: baseDomain,
-          incomingServers: [incoming],
-          outgoingServers: [outgoing],
-        )
+            displayName: baseDomain,
+            domains: [baseDomain],
+            displayShortName: baseDomain,
+            id: baseDomain,
+            incomingServers: [incoming],
+            outgoingServers: [outgoing],
+          )
           ..preferredIncomingServer = incoming
-          ..preferredIncomingImapServer =
-              incoming.type == ServerType.imap ? incoming : null
-          ..preferredIncomingPopServer =
-              incoming.type == ServerType.pop ? incoming : null
+          ..preferredIncomingImapServer = incoming.type == ServerType.imap
+              ? incoming
+              : null
+          ..preferredIncomingPopServer = incoming.type == ServerType.pop
+              ? incoming
+              : null
           ..preferredOutgoingServer = outgoing
           ..preferredOutgoingSmtpServer = outgoing,
       ];
@@ -249,7 +274,9 @@ class DiscoverHelper {
               info.port,
               timeout: const Duration(seconds: 10),
             );
-      info.socket = socket;
+      info
+        ..socket = socket
+        .._isReachable = true;
       if (isLogEnabled) {
         print('success at ${info.host}:${info.port}');
       }
@@ -317,8 +344,9 @@ class DiscoverHelper {
       final document = xml.XmlDocument.parse(definition);
       for (final node in document.children) {
         if (node is xml.XmlElement && node.name.local == 'clientConfig') {
-          final versionAttributes =
-              node.attributes.where((a) => a.name.local == 'version');
+          final versionAttributes = node.attributes.where(
+            (a) => a.name.local == 'version',
+          );
           config.version = versionAttributes.isNotEmpty
               ? versionAttributes.first.value
               : '1.1';
@@ -343,16 +371,19 @@ class DiscoverHelper {
                       provider.displayShortName = providerChild.innerText;
                       break;
                     case 'incomingServer':
-                      provider
-                          .addIncomingServer(_parseServerConfig(providerChild));
+                      provider.addIncomingServer(
+                        _parseServerConfig(providerChild),
+                      );
                       break;
                     case 'outgoingServer':
-                      provider
-                          .addOutgoingServer(_parseServerConfig(providerChild));
+                      provider.addOutgoingServer(
+                        _parseServerConfig(providerChild),
+                      );
                       break;
                     case 'documentation':
-                      provider.documentationUrl ??=
-                          providerChild.getAttribute('url');
+                      provider.documentationUrl ??= providerChild.getAttribute(
+                        'url',
+                      );
                       break;
                   }
                 }
@@ -376,25 +407,30 @@ class DiscoverHelper {
 
   static ServerConfig _parseServerConfig(xml.XmlElement serverElement) {
     final typeName = serverElement.getAttribute('type');
-    final children =
-        serverElement.children.whereType<xml.XmlElement>().toList();
-    final hostname =
-        children.firstWhereOrNull((e) => e.name.local == 'hostname')?.innerText;
-    final port =
-        children.firstWhereOrNull((e) => e.name.local == 'port')?.innerText;
+    final children = serverElement.children
+        .whereType<xml.XmlElement>()
+        .toList();
+    final hostname = children
+        .firstWhereOrNull((e) => e.name.local == 'hostname')
+        ?.innerText;
+    final port = children
+        .firstWhereOrNull((e) => e.name.local == 'port')
+        ?.innerText;
     final socketTypeName = children
         .firstWhereOrNull((e) => e.name.local == 'socketType')
         ?.innerText;
-    final authenticationElements =
-        children.where((e) => e.name.local == 'authentication').toList();
+    final authenticationElements = children
+        .where((e) => e.name.local == 'authentication')
+        .toList();
     final authenticationName = authenticationElements.isNotEmpty
         ? authenticationElements.first.innerText
         : null;
     final authenticationAlternativeName = authenticationElements.length > 1
         ? authenticationElements.last.innerText
         : null;
-    final username =
-        children.firstWhereOrNull((e) => e.name.local == 'username')?.innerText;
+    final username = children
+        .firstWhereOrNull((e) => e.name.local == 'username')
+        ?.innerText;
 
     final serverType = _serverTypeFromText(typeName);
 
@@ -530,9 +566,14 @@ class DiscoverConnectionInfo {
   /// The server type
   final ServerType serverType;
 
-  /// The used socket, when not null the caller is required to close it
+  /// The socket that was used to check the connection.
+  ///
+  /// It is destroyed by [DiscoverHelper.discoverFromConnections] right after
+  /// all connection attempts have finished.
   Socket? socket;
 
+  bool _isReachable = false;
+
   /// Checks if the server is ready to be used
-  bool ready(ServerType type) => serverType == type && socket != null;
+  bool ready(ServerType type) => serverType == type && _isReachable;
 }

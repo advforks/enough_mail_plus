@@ -29,10 +29,16 @@ abstract class ClientBase {
   /// The handler receives the [X509Certificate], and can inspect it and decide
   /// (or let the user decide) whether to accept the connection or not.
   /// The handler should return true to continue the [SecureSocket] connection.
+  ///
+  /// [securityContext] is an optional security context for mTLS
+  /// (mutual TLS / client certificate authentication).
+  /// Create a [SecurityContext] with `useCertificateChain()` and
+  /// `usePrivateKey()` to enable client certificate authentication.
   ClientBase({
     this.isLogEnabled = false,
     this.logName,
     this.onBadCertificate,
+    this.securityContext,
   });
 
   /// Initial for a client log output
@@ -62,7 +68,7 @@ abstract class ClientBase {
 
   /// Information about the connection
   late ConnectionInfo connectionInfo;
-  late Completer<ConnectionInfo> _greetingsCompleter;
+  Completer<ConnectionInfo>? _greetingsCompleter;
 
   bool _isConnected = false;
 
@@ -75,6 +81,12 @@ abstract class ClientBase {
   /// (or let the user decide) whether to accept the connection or not.
   /// The handler should return true to continue the [SecureSocket] connection.
   final bool Function(X509Certificate)? onBadCertificate;
+
+  /// Optional [SecurityContext] for mTLS (mutual TLS).
+  ///
+  /// When set, it is passed to [SecureSocket.connect] and
+  /// [SecureSocket.secure] to enable client certificate authentication.
+  final SecurityContext? securityContext;
 
   /// Is called when data is received
   void onDataReceived(Uint8List data);
@@ -112,13 +124,36 @@ abstract class ClientBase {
             host,
             port,
             onBadCertificate: onBadCertificate,
+            context: securityContext,
           ).timeout(timeout)
         : await Socket.connect(host, port).timeout(timeout);
-    _greetingsCompleter = Completer<ConnectionInfo>();
+    final greetingsCompleter = Completer<ConnectionInfo>();
+    _greetingsCompleter = greetingsCompleter;
     _isServerGreetingDone = false;
     connect(socket);
 
-    return _greetingsCompleter.future;
+    // the server greeting has to arrive within the timeout as well,
+    // otherwise e.g. a TLS port contacted without TLS would hang forever
+    return greetingsCompleter.future.timeout(
+      timeout,
+      onTimeout: () {
+        isSocketClosingExpected = true;
+        _isConnected = false;
+        socket.destroy();
+        throw createClientError(
+          'no server greeting received from $host:$port within $timeout',
+        );
+      },
+    );
+  }
+
+  /// Fails a pending [connectToServer] call when the connection ends before
+  /// the server greeting was received.
+  void _failGreeting(String reason) {
+    final completer = _greetingsCompleter;
+    if (completer != null && !completer.isCompleted) {
+      completer.completeError(createClientError(reason));
+    }
   }
 
   /// Starts to listen on the given [socket].
@@ -131,8 +166,11 @@ abstract class ClientBase {
   /// ```
   void connect(Socket socket, {ConnectionInfo? connectionInformation}) {
     if (connectionInformation != null) {
+      // used for manually created sockets, e.g. in tests: nobody awaits the
+      // greeting, so there must be no completer that could fail unhandled
       connectionInfo = connectionInformation;
-      _greetingsCompleter = Completer<ConnectionInfo>();
+      _greetingsCompleter = null;
+      _isServerGreetingDone = false;
     }
     _socket = socket;
     _writeFuture = null;
@@ -159,6 +197,7 @@ abstract class ClientBase {
     isLoggedIn = false;
     _isConnected = false;
     _writeFuture = null;
+    _failGreeting('connection error before server greeting: $e');
     if (!isSocketClosingExpected) {
       isSocketClosingExpected = true;
       try {
@@ -177,7 +216,14 @@ abstract class ClientBase {
   /// Upgrades the current connection to a secure socket
   Future<void> upgradeToSslSocket() async {
     _socketStreamSubscription.pause();
-    final secureSocket = await SecureSocket.secure(_socket);
+    final secureSocket = await SecureSocket.secure(
+      _socket,
+      // verify the certificate against the host the user asked for, not
+      // against whatever the resolved socket address reports
+      host: connectionInfo.host,
+      context: securityContext,
+      onBadCertificate: onBadCertificate,
+    );
     logApp('now using secure connection.');
     await _socketStreamSubscription.cancel();
     isSocketClosingExpected = true;
@@ -194,7 +240,10 @@ abstract class ClientBase {
       final serverGreeting = String.fromCharCodes(data);
       log(serverGreeting, isClient: false);
       onConnectionEstablished(connectionInfo, serverGreeting);
-      _greetingsCompleter.complete(connectionInfo);
+      final completer = _greetingsCompleter;
+      if (completer != null && !completer.isCompleted) {
+        completer.complete(connectionInfo);
+      }
     }
   }
 
@@ -203,6 +252,7 @@ abstract class ClientBase {
     logApp('Done, connection closed');
     isLoggedIn = false;
     _isConnected = false;
+    _failGreeting('connection closed before server greeting');
     if (!isSocketClosingExpected) {
       isSocketClosingExpected = true;
       onConnectionError('onDone not expected');
@@ -243,9 +293,11 @@ abstract class ClientBase {
       try {
         await previousWriteFuture;
       } catch (e, s) {
-        print('Unable to await previous write '
-            // ignore: unawaited_futures
-            'future $previousWriteFuture: $e $s');
+        print(
+          'Unable to await previous write '
+          // ignore: unawaited_futures
+          'future $previousWriteFuture: $e $s',
+        );
         _writeFuture = null;
         rethrow;
       }
@@ -256,8 +308,9 @@ abstract class ClientBase {
     }
     _socket.write('$text\r\n');
 
-    final future =
-        timeout == null ? _socket.flush() : _socket.flush().timeout(timeout);
+    final future = timeout == null
+        ? _socket.flush()
+        : _socket.flush().timeout(timeout);
     _writeFuture = future;
     await future;
     _writeFuture = null;
@@ -286,6 +339,30 @@ abstract class ClientBase {
     _writeFuture = future;
     await future;
     _writeFuture = null;
+  }
+
+  /// Writes to the socket via [write] and fails the [completer] with a
+  /// client error when the write fails, instead of leaving the completer
+  /// pending with an unhandled asynchronous error.
+  ///
+  /// [onWriteError] is called before the completer is failed, e.g. to forget
+  /// the command that the completer belongs to.
+  void writeOrFail(
+    Future<void> Function() write,
+    Completer<dynamic> completer, {
+    void Function()? onWriteError,
+  }) {
+    unawaited(
+      write().catchError((Object e, StackTrace s) {
+        onWriteError?.call();
+        if (!completer.isCompleted) {
+          completer.completeError(
+            createClientError('unable to send command: $e'),
+            s,
+          );
+        }
+      }),
+    );
   }
 
   /// Logs the data from the app-side
@@ -317,7 +394,7 @@ abstract class ClientBase {
   }
 
   /// Subclasses need to be able to create client specific exceptions
-  Object createClientError(String message);
+  Exception createClientError(String message);
 }
 
 /// Extends Completer instances

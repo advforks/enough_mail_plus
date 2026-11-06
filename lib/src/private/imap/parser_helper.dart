@@ -8,10 +8,13 @@ class ParserHelper {
   ParserHelper._();
 
   /// Helper method for parsing integer values within a line [details].
+  ///
+  /// Returns `null` when the [endCharacter] is missing or the text in
+  /// between is not a number.
   static int? parseInt(String details, int startIndex, String endCharacter) {
     final endIndex = details.indexOf(endCharacter, startIndex);
-    if (endIndex == -1) {
-      return -1;
+    if (endIndex == -1 || startIndex > details.length) {
+      return null;
     }
     final numericText = details.substring(startIndex, endIndex);
 
@@ -87,8 +90,12 @@ class ParserHelper {
     String endCharacter, [
     String separator = ' ',
   ]) {
-    final texts =
-        parseListEntries(details, startIndex, endCharacter, separator);
+    final texts = parseListEntries(
+      details,
+      startIndex,
+      endCharacter,
+      separator,
+    );
     if (texts == null) {
       return null;
     }

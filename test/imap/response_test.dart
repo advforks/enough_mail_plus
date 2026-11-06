@@ -1,5 +1,6 @@
 import 'package:enough_mail/enough_mail.dart';
 import 'package:test/test.dart';
+
 // cSpell:disable
 
 void main() {
@@ -21,10 +22,12 @@ void main() {
       expect(copyUid, isNotNull);
       expect(copyUid?.uidValidity, 14);
       expect(copyUid?.originalSequence?.toList(), [35986, 35987, 35988, 35989]);
-      expect(
-        copyUid?.targetSequence.toList(),
-        [172551, 172552, 172553, 172554],
-      );
+      expect(copyUid?.targetSequence.toList(), [
+        172551,
+        172552,
+        172553,
+        172554,
+      ]);
     });
 
     test('Igmore invalid COPYUID withhout sequences', () {

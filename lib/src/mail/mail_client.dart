@@ -3,7 +3,6 @@ import 'dart:io';
 import 'dart:math';
 
 import 'package:collection/collection.dart' show IterableExtension;
-import 'package:event_bus/event_bus.dart';
 import 'package:synchronized/synchronized.dart';
 
 import '../../enough_mail.dart';
@@ -64,26 +63,23 @@ class MailClient {
     MailAccount account, {
     bool isLogEnabled = false,
     int? downloadSizeLimit,
-    EventBus? eventBus,
     String? logName,
     this.defaultWriteTimeout = const Duration(seconds: 2),
     this.defaultResponseTimeout = const Duration(seconds: 5),
     bool Function(X509Certificate)? onBadCertificate,
     this.clientId,
     Future<OauthToken?> Function(MailClient client, OauthToken expiredToken)?
-        refresh,
+    refresh,
     Future Function(MailAccount account)? onConfigChanged,
-  })  : _eventBus = eventBus ?? EventBus(),
-        _account = account,
-        _isLogEnabled = isLogEnabled,
-        _downloadSizeLimit = downloadSizeLimit,
-        _refreshOAuthToken = refresh,
-        _onConfigChanged = onConfigChanged {
+  }) : _account = account,
+       _isLogEnabled = isLogEnabled,
+       _downloadSizeLimit = downloadSizeLimit,
+       _refreshOAuthToken = refresh,
+       _onConfigChanged = onConfigChanged {
     final config = _account.incoming;
     if (config.serverConfig.type == ServerType.imap) {
       _incomingMailClient = _IncomingImapClient(
         _downloadSizeLimit,
-        _eventBus,
         logName,
         defaultWriteTimeout,
         defaultResponseTimeout,
@@ -95,7 +91,6 @@ class MailClient {
     } else if (config.serverConfig.type == ServerType.pop) {
       _incomingMailClient = _IncomingPopClient(
         _downloadSizeLimit,
-        _eventBus,
         logName,
         config,
         this,
@@ -118,7 +113,6 @@ class MailClient {
     _outgoingMailClient = _OutgoingSmtpClient(
       this,
       _account.outgoingClientDomain,
-      _eventBus,
       'SMTP-$logName',
       outgoingConfig,
       isLogEnabled: _isLogEnabled,
@@ -150,7 +144,8 @@ class MailClient {
   final Future<OauthToken?> Function(
     MailClient client,
     OauthToken expiredToken,
-  )? _refreshOAuthToken;
+  )?
+  _refreshOAuthToken;
 
   /// Callback for getting notified when the config has changed,
   /// ie after an OAuth login token has been refreshed
@@ -168,13 +163,14 @@ class MailClient {
   /// Compare [connect]
   bool get isConnected => _isConnected;
 
-  /// event bus for firing and listening to events
-  EventBus get eventBus => _eventBus;
-  final EventBus _eventBus;
+  /// event stream for listening to events
+  Stream<MailEvent> get eventStream => _eventController.stream;
+  final StreamController<MailEvent> _eventController =
+      StreamController<MailEvent>.broadcast();
 
   /// Filter for mail events.
   ///
-  /// Allows to suppress events being forwarded to the [eventBus].
+  /// Allows to suppress events being forwarded to the [eventStream].
   List<MailEventFilter>? _eventFilters;
 
   final bool _isLogEnabled;
@@ -249,7 +245,7 @@ class MailClient {
   /// Adds the specified mail event [filter].
   ///
   /// You can use a filter to suppress matching `MailEvent`.
-  /// Compare [eventBus].
+  /// Compare [eventStream].
   void addEventFilter(MailEventFilter filter) {
     _eventFilters ??= <MailEventFilter>[];
     _eventFilters?.add(filter);
@@ -277,7 +273,7 @@ class MailClient {
         }
       }
     }
-    eventBus.fire(event);
+    _eventController.add(event);
   }
 
   //Future<List<MimeMessage>> poll(Mailbox mailbox) {}
@@ -293,7 +289,16 @@ class MailClient {
     _isConnected = true;
   }
 
-  Future<void> _prepareConnect() async {
+  final _tokenRefreshLock = Lock();
+
+  /// Refreshes the OAuth token when it is about to expire.
+  ///
+  /// Serialized so that concurrent callers, e.g. a reconnect and a send,
+  /// do not refresh the same token twice.
+  Future<void> _prepareConnect() =>
+      _tokenRefreshLock.synchronized(_refreshTokenIfRequired);
+
+  Future<void> _refreshTokenIfRequired() async {
     final refresh = _refreshOAuthToken;
     if (refresh != null) {
       final auth = account.incoming.authentication;
@@ -310,8 +315,14 @@ class MailClient {
         if (refreshed == null) {
           throw MailException(this, 'Unable to refresh token');
         }
-        final newToken =
-            auth.token.copyWith(refreshed.accessToken, refreshed.expiresIn);
+        // keep a rotated refresh token, otherwise the next refresh fails
+        final newToken = auth.token.copyWith(
+          refreshed.accessToken,
+          refreshed.expiresIn,
+          refreshToken: refreshed.refreshToken.isNotEmpty
+              ? refreshed.refreshToken
+              : null,
+        );
         final incoming = account.incoming.copyWith(
           authentication: auth.copyWith(token: newToken),
         );
@@ -322,10 +333,7 @@ class MailClient {
             authentication: outAuth.copyWith(token: newToken),
           );
         }
-        _account = _account.copyWith(
-          incoming: incoming,
-          outgoing: outgoing,
-        );
+        _account = _account.copyWith(incoming: incoming, outgoing: outgoing);
         _incomingMailClient._config = _account.incoming;
         _outgoingMailClient._mailConfig = _account.outgoing;
         final onConfigChanged = _onConfigChanged;
@@ -348,12 +356,8 @@ class MailClient {
   Future<void> disconnect() async {
     final futures = <Future>[
       stopPollingIfNeeded(),
-      _incomingLock.synchronized(
-        () => _incomingMailClient.disconnect(),
-      ),
-      _outgoingLock.synchronized(
-        () => _outgoingMailClient.disconnect(),
-      ),
+      _incomingLock.synchronized(() => _incomingMailClient.disconnect()),
+      _outgoingLock.synchronized(() => _outgoingMailClient.disconnect()),
     ];
     _isConnected = false;
     await Future.wait(futures);
@@ -364,13 +368,12 @@ class MailClient {
   /// Also compare [disconnect].
   /// Also compare [connect].
   Future<void> reconnect() async {
-    await _incomingLock.synchronized(
-      () async {
-        await _incomingMailClient.disconnect();
-        await _incomingMailClient.reconnect();
-        _isConnected = true;
-      },
-    );
+    await _incomingLock.synchronized(() => _incomingMailClient.disconnect());
+    // the reconnect loop must not run under the incoming lock: it retries
+    // until disconnect() is called, which needs the lock as well, and it
+    // lists the mailboxes through this client when required
+    await _incomingMailClient.reconnect();
+    _isConnected = true;
   }
 
   // Future<MailResponse> tryAuthenticate(
@@ -586,8 +589,9 @@ class MailClient {
     var mailboxes = _mailboxes;
     mailboxes ??= await listMailboxes();
     var inbox = mailboxes.firstWhereOrNull((box) => box.isInbox);
-    inbox ??=
-        mailboxes.firstWhereOrNull((box) => box.name.toLowerCase() == 'inbox');
+    inbox ??= mailboxes.firstWhereOrNull(
+      (box) => box.name.toLowerCase() == 'inbox',
+    );
     if (inbox == null) {
       throw MailException(this, 'Unable to find inbox');
     }
@@ -659,8 +663,11 @@ class MailClient {
     FetchPreference fetchPreference = FetchPreference.fullWhenWithinSize,
   }) async {
     final usedMailbox = await _selectMailboxIfNeeded(mailbox);
-    final sequence =
-        MessageSequence.fromPage(page, count, usedMailbox.messagesExists);
+    final sequence = MessageSequence.fromPage(
+      page,
+      count,
+      usedMailbox.messagesExists,
+    );
 
     return _incomingLock.synchronized(
       () => _incomingMailClient.fetchMessageSequence(
@@ -784,14 +791,13 @@ class MailClient {
     MimeMessage message,
     String fetchId, {
     Duration? responseTimeout,
-  }) =>
-      _incomingLock.synchronized(
-        () => _incomingMailClient.fetchMessagePart(
-          message,
-          fetchId,
-          responseTimeout: responseTimeout,
-        ),
-      );
+  }) => _incomingLock.synchronized(
+    () => _incomingMailClient.fetchMessagePart(
+      message,
+      fetchId,
+      responseTimeout: responseTimeout,
+    ),
+  );
 
   /// Retrieves the threads starting at [since].
   ///
@@ -982,16 +988,13 @@ class MailClient {
     if (appendToSent && _incomingMailClient.supportsAppendingMessages) {
       sentMailbox ??= getMailbox(MailboxFlag.sent);
       if (sentMailbox == null) {
-        _incomingMailClient
-            .log('Error:  unable to append sent message: no no mailbox with '
-                'flag sent found in $mailboxes');
+        _incomingMailClient.log(
+          'Error:  unable to append sent message: no no mailbox with '
+          'flag sent found in $mailboxes',
+        );
       } else {
         futures.add(
-          appendMessage(
-            message,
-            sentMailbox,
-            flags: [MessageFlags.seen],
-          ),
+          appendMessage(message, sentMailbox, flags: [MessageFlags.seen]),
         );
       }
     }
@@ -1025,18 +1028,17 @@ class MailClient {
   Future<UidResponseCode?> saveDraftMessage(
     MimeMessage message, {
     Mailbox? draftsMailbox,
-  }) =>
-      draftsMailbox == null
-          ? appendMessageToFlag(
-              message,
-              MailboxFlag.drafts,
-              flags: [MessageFlags.draft, MessageFlags.seen],
-            )
-          : appendMessage(
-              message,
-              draftsMailbox,
-              flags: [MessageFlags.draft, MessageFlags.seen],
-            );
+  }) => draftsMailbox == null
+      ? appendMessageToFlag(
+          message,
+          MailboxFlag.drafts,
+          flags: [MessageFlags.draft, MessageFlags.seen],
+        )
+      : appendMessage(
+          message,
+          draftsMailbox,
+          flags: [MessageFlags.draft, MessageFlags.seen],
+        );
 
   /// Appends the [message] to the mailbox with the [targetMailboxFlag].
   ///
@@ -1064,14 +1066,13 @@ class MailClient {
     MimeMessage message,
     Mailbox targetMailbox, {
     List<String>? flags,
-  }) =>
-      _incomingLock.synchronized(
-        () => _incomingMailClient.appendMessage(message, targetMailbox, flags),
-      );
+  }) => _incomingLock.synchronized(
+    () => _incomingMailClient.appendMessage(message, targetMailbox, flags),
+  );
 
   /// Starts listening for new incoming messages.
   ///
-  /// Listen for [MailLoadEvent] on the [eventBus] to get notified
+  /// Listen for [MailLoadEvent] on the [eventStream] to get notified
   /// about new messages.
   Future<void> startPolling([Duration duration = defaultPollingDuration]) =>
       _incomingLock.synchronized(
@@ -1079,9 +1080,8 @@ class MailClient {
       );
 
   /// Stops listening for new messages.
-  Future<void> stopPolling() => _incomingLock.synchronized(
-        () => _incomingMailClient.stopPolling(),
-      );
+  Future<void> stopPolling() =>
+      _incomingLock.synchronized(() => _incomingMailClient.stopPolling());
 
   /// Stops listening for new messages if this client is currently polling.
   Future<void> stopPollingIfNeeded() {
@@ -1101,28 +1101,27 @@ class MailClient {
   /// Set the [startPollingWhenError] to `false` in case polling should not
   /// be started again when an error occurred.
   Future<void> resume({bool startPollingWhenError = true}) async {
-    await _incomingLock.synchronized(
-      () async {
-        _incomingMailClient.log('resume mail client');
-        try {
-          await _incomingMailClient.stopPolling();
+    _incomingMailClient.log('resume mail client');
+    try {
+      await _incomingLock.synchronized(() async {
+        await _incomingMailClient.stopPolling();
+        await _incomingMailClient.startPolling(defaultPollingDuration);
+      });
+    } catch (e, s) {
+      _incomingMailClient.log('error while resuming: $e $s');
+      // re-connect explicitly, compare [reconnect] for why this must not
+      // happen under the incoming lock:
+      try {
+        await _incomingMailClient.reconnect();
+        if (startPollingWhenError && !_incomingMailClient.isPolling()) {
           await _incomingMailClient.startPolling(defaultPollingDuration);
-        } catch (e, s) {
-          _incomingMailClient.log('error while resuming: $e $s');
-          // re-connect explicitly:
-          try {
-            await _incomingMailClient.reconnect();
-            if (startPollingWhenError && !_incomingMailClient.isPolling()) {
-              await _incomingMailClient.startPolling(defaultPollingDuration);
-            }
-          } catch (e2, s2) {
-            _incomingMailClient.log(
-              'error while trying to reconnect in resume: $e2 $s2',
-            );
-          }
         }
-      },
-    );
+      } catch (e2, s2) {
+        _incomingMailClient.log(
+          'error while trying to reconnect in resume: $e2 $s2',
+        );
+      }
+    }
   }
 
   /// Determines if message flags such as `\Seen` can be stored.
@@ -1145,12 +1144,9 @@ class MailClient {
   Future<void> markSeen(
     MessageSequence sequence, {
     int? unchangedSinceModSequence,
-  }) =>
-      store(
-        sequence,
-        [MessageFlags.seen],
-        unchangedSinceModSequence: unchangedSinceModSequence,
-      );
+  }) => store(sequence, [
+    MessageFlags.seen,
+  ], unchangedSinceModSequence: unchangedSinceModSequence);
 
   /// Mark the messages from the specified [sequence] as unseen/unread.
   ///
@@ -1164,13 +1160,12 @@ class MailClient {
   Future<void> markUnseen(
     MessageSequence sequence, {
     int? unchangedSinceModSequence,
-  }) =>
-      store(
-        sequence,
-        [MessageFlags.seen],
-        action: StoreAction.remove,
-        unchangedSinceModSequence: unchangedSinceModSequence,
-      );
+  }) => store(
+    sequence,
+    [MessageFlags.seen],
+    action: StoreAction.remove,
+    unchangedSinceModSequence: unchangedSinceModSequence,
+  );
 
   /// Mark the messages from the specified [sequence] as flagged.
   ///
@@ -1184,12 +1179,9 @@ class MailClient {
   Future<void> markFlagged(
     MessageSequence sequence, {
     int? unchangedSinceModSequence,
-  }) =>
-      store(
-        sequence,
-        [MessageFlags.flagged],
-        unchangedSinceModSequence: unchangedSinceModSequence,
-      );
+  }) => store(sequence, [
+    MessageFlags.flagged,
+  ], unchangedSinceModSequence: unchangedSinceModSequence);
 
   /// Mark the messages from the specified [sequence] as unflagged.
   ///
@@ -1203,13 +1195,12 @@ class MailClient {
   Future<void> markUnflagged(
     MessageSequence sequence, {
     int? unchangedSinceModSequence,
-  }) =>
-      store(
-        sequence,
-        [MessageFlags.flagged],
-        action: StoreAction.remove,
-        unchangedSinceModSequence: unchangedSinceModSequence,
-      );
+  }) => store(
+    sequence,
+    [MessageFlags.flagged],
+    action: StoreAction.remove,
+    unchangedSinceModSequence: unchangedSinceModSequence,
+  );
 
   /// Mark the messages from the specified [sequence] as deleted.
   ///
@@ -1223,12 +1214,9 @@ class MailClient {
   Future<void> markDeleted(
     MessageSequence sequence, {
     int? unchangedSinceModSequence,
-  }) =>
-      store(
-        sequence,
-        [MessageFlags.deleted],
-        unchangedSinceModSequence: unchangedSinceModSequence,
-      );
+  }) => store(sequence, [
+    MessageFlags.deleted,
+  ], unchangedSinceModSequence: unchangedSinceModSequence);
 
   /// Mark the messages from the specified [sequence] as not deleted.
   ///
@@ -1242,13 +1230,12 @@ class MailClient {
   Future<void> markUndeleted(
     MessageSequence sequence, {
     int? unchangedSinceModSequence,
-  }) =>
-      store(
-        sequence,
-        [MessageFlags.deleted],
-        action: StoreAction.remove,
-        unchangedSinceModSequence: unchangedSinceModSequence,
-      );
+  }) => store(
+    sequence,
+    [MessageFlags.deleted],
+    action: StoreAction.remove,
+    unchangedSinceModSequence: unchangedSinceModSequence,
+  );
 
   /// Mark the messages from the specified [sequence] as answered.
   ///
@@ -1262,12 +1249,9 @@ class MailClient {
   Future<void> markAnswered(
     MessageSequence sequence, {
     int? unchangedSinceModSequence,
-  }) =>
-      store(
-        sequence,
-        [MessageFlags.answered],
-        unchangedSinceModSequence: unchangedSinceModSequence,
-      );
+  }) => store(sequence, [
+    MessageFlags.answered,
+  ], unchangedSinceModSequence: unchangedSinceModSequence);
 
   /// Mark the messages from the specified [sequence] as not answered.
   ///
@@ -1281,13 +1265,12 @@ class MailClient {
   Future<void> markUnanswered(
     MessageSequence sequence, {
     int? unchangedSinceModSequence,
-  }) =>
-      store(
-        sequence,
-        [MessageFlags.answered],
-        action: StoreAction.remove,
-        unchangedSinceModSequence: unchangedSinceModSequence,
-      );
+  }) => store(
+    sequence,
+    [MessageFlags.answered],
+    action: StoreAction.remove,
+    unchangedSinceModSequence: unchangedSinceModSequence,
+  );
 
   /// Mark from the specified [sequence] as forwarded.
   ///
@@ -1303,12 +1286,9 @@ class MailClient {
     MessageSequence sequence, {
     bool? silent,
     int? unchangedSinceModSequence,
-  }) =>
-      store(
-        sequence,
-        [MessageFlags.keywordForwarded],
-        unchangedSinceModSequence: unchangedSinceModSequence,
-      );
+  }) => store(sequence, [
+    MessageFlags.keywordForwarded,
+  ], unchangedSinceModSequence: unchangedSinceModSequence);
 
   /// Mark the messages from the specified [sequence] as not forwarded.
   ///
@@ -1323,13 +1303,12 @@ class MailClient {
   Future<void> markUnforwarded(
     MessageSequence sequence, {
     int? unchangedSinceModSequence,
-  }) =>
-      store(
-        sequence,
-        [MessageFlags.keywordForwarded],
-        action: StoreAction.remove,
-        unchangedSinceModSequence: unchangedSinceModSequence,
-      );
+  }) => store(
+    sequence,
+    [MessageFlags.keywordForwarded],
+    action: StoreAction.remove,
+    unchangedSinceModSequence: unchangedSinceModSequence,
+  );
 
   /// Flags the [message] with the specified flags.
   ///
@@ -1395,15 +1374,14 @@ class MailClient {
     List<String> flags, {
     StoreAction action = StoreAction.add,
     int? unchangedSinceModSequence,
-  }) =>
-      _incomingLock.synchronized(
-        () => _incomingMailClient.store(
-          sequence,
-          flags,
-          action,
-          unchangedSinceModSequence,
-        ),
-      );
+  }) => _incomingLock.synchronized(
+    () => _incomingMailClient.store(
+      sequence,
+      flags,
+      action,
+      unchangedSinceModSequence,
+    ),
+  );
 
   /// Deletes the given [message].
   ///
@@ -1420,8 +1398,7 @@ class MailClient {
   Future<DeleteResult> deleteMessage(
     MimeMessage message, {
     bool expunge = false,
-  }) =>
-      deleteMessages(MessageSequence.fromMessage(message), expunge: expunge);
+  }) => deleteMessages(MessageSequence.fromMessage(message), expunge: expunge);
 
   /// Deletes the given message [sequence].
   ///
@@ -1498,8 +1475,7 @@ class MailClient {
   Future<MoveResult> junkMessages(
     MessageSequence sequence, {
     List<MimeMessage>? messages,
-  }) =>
-      moveMessagesToFlag(sequence, MailboxFlag.junk, messages: messages);
+  }) => moveMessagesToFlag(sequence, MailboxFlag.junk, messages: messages);
 
   /// Moves the specified [message] to the inbox folder
   ///
@@ -1513,8 +1489,7 @@ class MailClient {
   Future<MoveResult> moveMessagesToInbox(
     MessageSequence sequence, {
     List<MimeMessage>? messages,
-  }) =>
-      moveMessagesToFlag(sequence, MailboxFlag.inbox, messages: messages);
+  }) => moveMessagesToFlag(sequence, MailboxFlag.inbox, messages: messages);
 
   /// Moves the specified [message] to the folder flagged
   /// with the specified mailbox [flag].
@@ -1581,39 +1556,30 @@ class MailClient {
     MessageSequence sequence,
     Mailbox target, {
     List<MimeMessage>? messages,
-  }) =>
-      _incomingLock.synchronized(
-        () => _incomingMailClient.moveMessages(
-          sequence,
-          target,
-          messages: messages,
-        ),
-      );
+  }) => _incomingLock.synchronized(
+    () =>
+        _incomingMailClient.moveMessages(sequence, target, messages: messages),
+  );
 
   /// Reverts the previous move operation, if possible.
   ///
   /// When messages have been specified for the original [moveMessages]
   /// operation, then the UIDs of those messages will be adjusted
   /// automatically.
-  Future<MoveResult> undoMoveMessages(MoveResult moveResult) =>
-      _incomingLock.synchronized(
-        () => _incomingMailClient.undoMove(moveResult),
-      );
+  Future<MoveResult> undoMoveMessages(MoveResult moveResult) => _incomingLock
+      .synchronized(() => _incomingMailClient.undoMove(moveResult));
 
   /// Searches the messages with the criteria defined in [search].
   ///
   /// Compare [searchMessagesNextPage] for retrieving the next page
   /// of search results.
-  Future<MailSearchResult> searchMessages(MailSearch search) =>
-      _incomingLock.synchronized(
-        () => _incomingMailClient.searchMessages(search),
-      );
+  Future<MailSearchResult> searchMessages(MailSearch search) => _incomingLock
+      .synchronized(() => _incomingMailClient.searchMessages(search));
 
   /// Retrieves the next page of messages for the specified [searchResult].
   Future<List<MimeMessage>> searchMessagesNextPage(
     MailSearchResult searchResult,
-  ) =>
-      fetchNextPage(searchResult);
+  ) => fetchNextPage(searchResult);
 
   /// Retrieves the next page of messages for the specified [pagedResult].
   Future<List<MimeMessage>> fetchNextPage(
@@ -1682,7 +1648,45 @@ enum ThreadPreference {
   all,
 
   /// Only the newest message of each thread is fetched
-  latest
+  latest,
+}
+
+/// Ensures that the connection of [client] is encrypted as demanded by the
+/// socket type of the server [config] before any credentials are sent.
+///
+/// [SocketType.ssl] connections are encrypted already and
+/// [SocketType.plainNoStartTls] allows clear text explicitly. Every other
+/// socket type requires STARTTLS: when [supportsStartTls] reports that the
+/// server does not offer it, the connection is closed and a client error is
+/// thrown instead of silently falling back to clear text, because an
+/// attacker could just strip the capability to obtain the credentials.
+Future<void> _requireEncryption(
+  ClientBase client,
+  ServerConfig config, {
+  required Future<bool> Function() supportsStartTls,
+  required Future<void> Function() startTls,
+}) async {
+  switch (config.socketType) {
+    case SocketType.ssl:
+      return;
+    case SocketType.plainNoStartTls:
+      client.logApp(
+        'Warning: connecting without encryption, '
+        'your credentials are not secure.',
+      );
+
+      return;
+    default:
+      if (!await supportsStartTls()) {
+        await client.disconnect();
+        throw client.createClientError(
+          'STARTTLS is not supported by ${config.hostname}, '
+          'refusing to authenticate over an unencrypted connection. '
+          'Use SocketType.plainNoStartTls to allow this explicitly.',
+        );
+      }
+      await startTls();
+  }
 }
 
 abstract class _IncomingMailClient {
@@ -1804,7 +1808,13 @@ abstract class _IncomingMailClient {
   Future<void> _poll(Timer timer) async {
     final callback = _pollImplementation;
     if (callback != null) {
-      await callback();
+      try {
+        await callback();
+      } catch (e, s) {
+        // an exception from a timer callback would otherwise surface as an
+        // unhandled asynchronous error
+        log('polling failed: $e $s');
+      }
     }
   }
 
@@ -1844,7 +1854,6 @@ abstract class _IncomingMailClient {
 class _IncomingImapClient extends _IncomingMailClient {
   _IncomingImapClient(
     int? downloadSizeLimit,
-    EventBus eventBus,
     String? logName,
     Duration? defaultWriteTimeout,
     Duration? defaultResponseTimeout,
@@ -1852,16 +1861,15 @@ class _IncomingImapClient extends _IncomingMailClient {
     MailClient mailClient, {
     required bool isLogEnabled,
     bool Function(X509Certificate)? onBadCertificate,
-  })  : _imapClient = ImapClient(
-          bus: eventBus,
-          isLogEnabled: isLogEnabled,
-          logName: logName,
-          onBadCertificate: onBadCertificate,
-          defaultWriteTimeout: defaultWriteTimeout,
-          defaultResponseTimeout: defaultResponseTimeout,
-        ),
-        super(downloadSizeLimit, config, mailClient) {
-    eventBus.on<ImapEvent>().listen(_onImapEvent);
+  }) : _imapClient = ImapClient(
+         isLogEnabled: isLogEnabled,
+         logName: logName,
+         onBadCertificate: onBadCertificate,
+         defaultWriteTimeout: defaultWriteTimeout,
+         defaultResponseTimeout: defaultResponseTimeout,
+       ),
+       super(downloadSizeLimit, config, mailClient) {
+    _imapClient.eventStream.listen(_onImapEvent);
   }
 
   @override
@@ -1924,8 +1932,9 @@ class _IncomingImapClient extends _IncomingMailClient {
         }
         final sequence = MessageSequence();
         if (evt.newMessagesExists - evt.oldMessagesExists > 1) {
-          final oldMessagesExists =
-              evt.oldMessagesExists == 0 ? 1 : evt.oldMessagesExists;
+          final oldMessagesExists = evt.oldMessagesExists == 0
+              ? 1
+              : evt.oldMessagesExists;
           final range = evt.newMessagesExists - oldMessagesExists;
           if (range > 100) {
             // this is very unlikely, limit the number of fetched messages:
@@ -2029,8 +2038,9 @@ class _IncomingImapClient extends _IncomingMailClient {
     final box = _selectedMailbox;
     final uidNext = box?.uidNext;
     _imapClient.stashQueuedTasks();
-    final qresync =
-        _imapClient.serverInfo.supportsQresync ? box?.qresync : null;
+    final qresync = _imapClient.serverInfo.supportsQresync
+        ? box?.qresync
+        : null;
     const minRetryDurationSeconds = 5;
     const maxRetryDurationSeconds = 5 * 60;
     var retryDurationSeconds = minRetryDurationSeconds;
@@ -2045,14 +2055,14 @@ class _IncomingImapClient extends _IncomingMailClient {
         await connect();
         _imapClient.logApp('connected.');
         _isInIdleMode = false;
-        _imapClient.logApp(
-          're-select mailbox "${box?.path ?? 'inbox'}".',
-        );
+        _imapClient.logApp('re-select mailbox "${box?.path ?? 'inbox'}".');
 
         if (box != null) {
           try {
-            _selectedMailbox =
-                await _imapClient.selectMailbox(box, qresync: qresync);
+            _selectedMailbox = await _imapClient.selectMailbox(
+              box,
+              qresync: qresync,
+            );
           } catch (e, s) {
             _imapClient.logApp('failed to re-select mailbox: $e $s');
             _selectedMailbox = qresync != null
@@ -2063,7 +2073,8 @@ class _IncomingImapClient extends _IncomingMailClient {
           _selectedMailbox = await _imapClient.selectInbox();
           mailClient._selectedMailbox = _selectedMailbox;
           if (mailClient.mailboxes == null) {
-            await mailClient.listMailboxes();
+            // not via MailClient.listMailboxes(), which takes the lock
+            mailClient._mailboxes = await listMailboxes();
           }
         }
         _imapClient.logApp('done selecting mailbox $_selectedMailbox.');
@@ -2086,13 +2097,17 @@ class _IncomingImapClient extends _IncomingMailClient {
         _imapClient.logApp('done reconnecting.');
         try {
           final isManualSynchronizationRequired = qresync == null;
-          mailClient._fireEvent(MailConnectionReEstablishedEvent(
-            mailClient,
-            isManualSynchronizationRequired: isManualSynchronizationRequired,
-          ));
+          mailClient._fireEvent(
+            MailConnectionReEstablishedEvent(
+              mailClient,
+              isManualSynchronizationRequired: isManualSynchronizationRequired,
+            ),
+          );
         } catch (e, s) {
-          log('Error: receiver could not handle '
-              'MailConnectionReEstablishedEvent: $e $s');
+          log(
+            'Error: receiver could not handle '
+            'MailConnectionReEstablishedEvent: $e $s',
+          );
         }
         // exist reconnect loop:
 
@@ -2101,8 +2116,11 @@ class _IncomingImapClient extends _IncomingMailClient {
         _imapClient.logApp('Unable to reconnect: $e $s');
       }
       await Future.delayed(Duration(seconds: retryDurationSeconds));
-      retryDurationSeconds =
-          max(retryDurationSeconds * 2, maxRetryDurationSeconds);
+      // exponential backoff up to the maximum
+      retryDurationSeconds = min(
+        retryDurationSeconds * 2,
+        maxRetryDurationSeconds,
+      );
     }
   }
 
@@ -2127,8 +2145,10 @@ class _IncomingImapClient extends _IncomingMailClient {
           mailClient._fireEvent(MailLoadEvent(message, mailClient));
         }
       } catch (e, s) {
-        log('Error: receiver could not handle MailLoadEvent after '
-            're-establishing connection: $e $s');
+        log(
+          'Error: receiver could not handle MailLoadEvent after '
+          're-establishing connection: $e $s',
+        );
       }
     }
   }
@@ -2143,18 +2163,24 @@ class _IncomingImapClient extends _IncomingMailClient {
       isSecure: isSecure,
       timeout: timeout,
     );
-    if (!isSecure) {
-      if (_imapClient.serverInfo.supportsStartTls &&
-          (serverConfig.socketType != SocketType.plainNoStartTls)) {
-        await _imapClient.startTls();
-      } else {
-        log('Warning: connecting without encryption, '
-            'your credentials are not secure.');
-      }
-    }
     try {
-      await _config.authentication
-          .authenticate(serverConfig, imap: _imapClient);
+      await _requireEncryption(
+        _imapClient,
+        serverConfig,
+        supportsStartTls: () async {
+          // the greeting does not have to announce the capabilities
+          if (_imapClient.serverInfo.capabilities?.isEmpty ?? true) {
+            await _imapClient.capability();
+          }
+
+          return _imapClient.serverInfo.supportsStartTls;
+        },
+        startTls: _imapClient.startTls,
+      );
+      await _config.authentication.authenticate(
+        serverConfig,
+        imap: _imapClient,
+      );
     } on ImapException catch (e, s) {
       throw MailException.fromImap(mailClient, e, s);
     } catch (e, s) {
@@ -2167,9 +2193,7 @@ class _IncomingImapClient extends _IncomingMailClient {
     if (serverInfo.supportsId) {
       _serverId = await _imapClient.id(clientId: mailClient.clientId);
     }
-    _config = _config.copyWith(
-      serverCapabilities: serverInfo.capabilities,
-    );
+    _config = _config.copyWith(serverCapabilities: serverInfo.capabilities);
     final enableCaps = <String>[];
     if (serverInfo.supportsQresync) {
       enableCaps.add(ImapServerInfo.capabilityQresync);
@@ -2179,8 +2203,9 @@ class _IncomingImapClient extends _IncomingMailClient {
     }
     if (enableCaps.isNotEmpty) {
       await _imapClient.enable(enableCaps);
-      _isQResyncEnabled =
-          _imapClient.serverInfo.isEnabled(ImapServerInfo.capabilityQresync);
+      _isQResyncEnabled = _imapClient.serverInfo.isEnabled(
+        ImapServerInfo.capabilityQresync,
+      );
     }
     _supportsIdle = serverInfo.supportsIdle;
   }
@@ -2188,6 +2213,9 @@ class _IncomingImapClient extends _IncomingMailClient {
   @override
   Future<void> disconnect() {
     _reconnectCounter++; // this aborts the reconnect cycle
+    // an aborted reconnect must not keep swallowing events forever:
+    _isReconnecting = false;
+    _imapEventsDuringReconnecting.clear();
 
     return _imapClient.disconnect();
   }
@@ -2217,14 +2245,16 @@ class _IncomingImapClient extends _IncomingMailClient {
     await _pauseIdle();
     try {
       if (_selectedMailbox != null) {
-        await _imapClient.closeMailbox();
+        await _deselectMailbox();
       }
       var quickReSync = qresync;
       if (qresync == null &&
           _isQResyncEnabled &&
           mailbox.highestModSequence != null) {
-        quickReSync =
-            QResyncParameters(mailbox.uidValidity, mailbox.highestModSequence);
+        quickReSync = QResyncParameters(
+          mailbox.uidValidity,
+          mailbox.highestModSequence,
+        );
       }
       final selectedMailbox = await _imapClient.selectMailbox(
         mailbox,
@@ -2299,8 +2329,8 @@ class _IncomingImapClient extends _IncomingMailClient {
       case FetchPreference.fullWhenWithinSize:
         criteria = downloadSizeLimit == null
             ? markAsSeen
-                ? '(UID FLAGS RFC822.SIZE BODY[])'
-                : '(UID FLAGS RFC822.SIZE BODY.PEEK[])'
+                  ? '(UID FLAGS RFC822.SIZE BODY[])'
+                  : '(UID FLAGS RFC822.SIZE BODY.PEEK[])'
             : '(UID FLAGS RFC822.SIZE ENVELOPE)';
         timeout = const Duration(seconds: 120);
         break;
@@ -2362,11 +2392,13 @@ class _IncomingImapClient extends _IncomingMailClient {
     bool markAsSeen,
     Duration? timeout,
   ) async {
-    final smallEnoughMessages = fetchImapResult.messages
-        .where((msg) => (msg.size ?? 0) < downloadSizeLimit);
+    final smallEnoughMessages = fetchImapResult.messages.where(
+      (msg) => (msg.size ?? 0) < downloadSizeLimit,
+    );
     final smallMessagesSequenceUids = MessageSequence(isUidSequence: true);
-    final smallMessagesSequenceSequenceIds =
-        MessageSequence(isUidSequence: false);
+    final smallMessagesSequenceSequenceIds = MessageSequence(
+      isUidSequence: false,
+    );
     for (final msg in smallEnoughMessages) {
       final uid = msg.uid;
       if (uid != null) {
@@ -2384,16 +2416,18 @@ class _IncomingImapClient extends _IncomingMailClient {
         responseTimeout: timeout,
       );
 
-      fetchImapResult
-          .replaceMatchingMessages(smallMessagesFetchResult.messages);
+      fetchImapResult.replaceMatchingMessages(
+        smallMessagesFetchResult.messages,
+      );
     } else if (smallMessagesSequenceSequenceIds.isNotEmpty) {
       final smallMessagesFetchResult = await _imapClient.fetchMessages(
         smallMessagesSequenceSequenceIds,
         markAsSeen ? '(UID FLAGS BODY[])' : '(UID FLAGS BODY.PEEK[])',
         responseTimeout: timeout,
       );
-      fetchImapResult
-          .replaceMatchingMessages(smallMessagesFetchResult.messages);
+      fetchImapResult.replaceMatchingMessages(
+        smallMessagesFetchResult.messages,
+      );
     }
   }
 
@@ -2488,8 +2522,10 @@ class _IncomingImapClient extends _IncomingMailClient {
       }
     }
 
-    return super
-        .startPolling(pollDuration, pollImplementation: pollImplementation);
+    return super.startPolling(
+      pollDuration,
+      pollImplementation: pollImplementation,
+    );
   }
 
   @override
@@ -2605,10 +2641,12 @@ class _IncomingImapClient extends _IncomingMailClient {
               ? includedInlineTypes
               : [MediaToptype.text, ...includedInlineTypes];
 
-          matchingContents.removeWhere((info) =>
-              (info.contentDisposition?.disposition ==
-                  ContentDisposition.inline) &&
-              !included.contains(info.mediaType?.top));
+          matchingContents.removeWhere(
+            (info) =>
+                (info.contentDisposition?.disposition ==
+                    ContentDisposition.inline) &&
+                !included.contains(info.mediaType?.top),
+          );
         }
         final buffer = StringBuffer()..write('(FLAGS BODY[HEADER] ');
         if (message.envelope == null) {
@@ -2718,14 +2756,9 @@ class _IncomingImapClient extends _IncomingMailClient {
     if (trashMailbox == null || trashMailbox == selectedMailbox || expunge) {
       try {
         await _pauseIdle();
-        await _imapClient.store(
-          sequence,
-          [MessageFlags.deleted],
-          action: StoreAction.add,
-          silent: true,
-        );
+        await _markDeleted(sequence);
         if (expunge) {
-          await _imapClient.expunge();
+          await _expunge(sequence);
         }
         final canUndo = !expunge;
 
@@ -2760,12 +2793,7 @@ class _IncomingImapClient extends _IncomingMailClient {
           imapResult = sequence.isUidSequence
               ? await _imapClient.uidCopy(sequence, targetMailbox: trashMailbox)
               : await _imapClient.copy(sequence, targetMailbox: trashMailbox);
-          await _imapClient.store(
-            sequence,
-            [MessageFlags.deleted],
-            action: StoreAction.add,
-            silent: true,
-          );
+          await _markDeleted(sequence);
         }
         // note: explicitly do not EXPUNGE after delete,
         // so that undo becomes easier
@@ -2793,6 +2821,39 @@ class _IncomingImapClient extends _IncomingMailClient {
     }
   }
 
+  /// Flags the messages of [sequence] as deleted, using `UID STORE` for UID
+  /// sequences: a plain `STORE` would interpret the UIDs as sequence numbers
+  /// and flag the wrong messages.
+  Future<void> _markDeleted(MessageSequence sequence) => sequence.isUidSequence
+      ? _imapClient.uidStore(
+          sequence,
+          [MessageFlags.deleted],
+          action: StoreAction.add,
+          silent: true,
+        )
+      : _imapClient.store(
+          sequence,
+          [MessageFlags.deleted],
+          action: StoreAction.add,
+          silent: true,
+        );
+
+  /// Expunges the messages of [sequence] only (RFC 4315 `UID EXPUNGE`) when
+  /// possible, otherwise all messages flagged as deleted.
+  Future<void> _expunge(MessageSequence sequence) =>
+      sequence.isUidSequence && _imapClient.serverInfo.supportsUidPlus
+      ? _imapClient.uidExpunge(sequence)
+      : _imapClient.expunge();
+
+  /// Leaves the currently selected mailbox without expunging it.
+  ///
+  /// `CLOSE` implicitly expunges every message flagged as deleted, which
+  /// would silently destroy messages that were deleted with `canUndo`, so
+  /// `UNSELECT` (RFC 3691) is used whenever the server supports it.
+  Future<void> _deselectMailbox() => _imapClient.serverInfo.supports('UNSELECT')
+      ? _imapClient.unselectMailbox()
+      : _imapClient.closeMailbox();
+
   @override
   Future<DeleteResult> undoDeleteMessages(DeleteResult deleteResult) async {
     switch (deleteResult.action) {
@@ -2807,7 +2868,7 @@ class _IncomingImapClient extends _IncomingMailClient {
       case DeleteAction.move:
         try {
           await _pauseIdle();
-          await _imapClient.closeMailbox();
+          await _deselectMailbox();
           await _imapClient.selectMailbox(
             deleteResult.targetMailbox.toValueOrThrow('no targetMailbox found'),
           );
@@ -2825,7 +2886,7 @@ class _IncomingImapClient extends _IncomingMailClient {
                     targetMailbox: deleteResult.originalMailbox,
                   );
           }
-          await _imapClient.closeMailbox();
+          await _deselectMailbox();
           await _imapClient.selectMailbox(deleteResult.originalMailbox);
           if (result == null) {
             throw MailException(
@@ -2834,8 +2895,9 @@ class _IncomingImapClient extends _IncomingMailClient {
               'result without target sequence in $deleteResult',
             );
           }
-          final undoResult =
-              deleteResult.reverseWith(result.responseCodeCopyUid);
+          final undoResult = deleteResult.reverseWith(
+            result.responseCodeCopyUid,
+          );
 
           return undoResult;
         } on ImapException catch (e) {
@@ -2847,39 +2909,31 @@ class _IncomingImapClient extends _IncomingMailClient {
         try {
           await _pauseIdle();
           if (deleteResult.originalSequence.isUidSequence) {
-            await _imapClient.uidStore(
-              deleteResult.originalSequence,
-              [MessageFlags.deleted],
-              action: StoreAction.remove,
-            );
+            await _imapClient.uidStore(deleteResult.originalSequence, [
+              MessageFlags.deleted,
+            ], action: StoreAction.remove);
           } else {
-            await _imapClient.store(
-              deleteResult.originalSequence,
-              [MessageFlags.deleted],
-              action: StoreAction.remove,
-            );
+            await _imapClient.store(deleteResult.originalSequence, [
+              MessageFlags.deleted,
+            ], action: StoreAction.remove);
           }
           final targetMailbox = deleteResult.targetMailbox;
           final targetSequence = deleteResult.targetSequence;
           if (targetMailbox != null && targetSequence != null) {
-            await _imapClient.closeMailbox();
+            await _deselectMailbox();
             await _imapClient.selectMailbox(targetMailbox);
 
             if (targetSequence.isUidSequence) {
-              await _imapClient.uidStore(
-                targetSequence,
-                [MessageFlags.deleted],
-                action: StoreAction.add,
-              );
+              await _imapClient.uidStore(targetSequence, [
+                MessageFlags.deleted,
+              ], action: StoreAction.add);
             } else {
-              await _imapClient.store(
-                targetSequence,
-                [MessageFlags.deleted],
-                action: StoreAction.add,
-              );
+              await _imapClient.store(targetSequence, [
+                MessageFlags.deleted,
+              ], action: StoreAction.add);
             }
 
-            await _imapClient.closeMailbox();
+            await _deselectMailbox();
             await _imapClient.selectMailbox(deleteResult.originalMailbox);
           }
         } on ImapException catch (e) {
@@ -2960,11 +3014,7 @@ class _IncomingImapClient extends _IncomingMailClient {
       imapResult = sequence.isUidSequence
           ? await _imapClient.uidCopy(sequence, targetMailbox: target)
           : await _imapClient.copy(sequence, targetMailbox: target);
-      await _imapClient.store(
-        sequence,
-        [MessageFlags.deleted],
-        action: StoreAction.add,
-      );
+      await _markDeleted(sequence);
     }
     _selectedMailbox?.messagesExists -= sequence.length;
     final targetSequence = imapResult.responseCodeCopyUid?.targetSequence;
@@ -3157,8 +3207,10 @@ class _IncomingImapClient extends _IncomingMailClient {
             ? SequenceNodeSelectionMode.lastLeaf
             : SequenceNodeSelectionMode.all,
       );
-      final pagedThreadSequence =
-          PagedMessageSequence(threadSequence, pageSize: pageSize);
+      final pagedThreadSequence = PagedMessageSequence(
+        threadSequence,
+        pageSize: pageSize,
+      );
       final result = ThreadResult(
         threadNodes,
         pagedThreadSequence,
@@ -3259,19 +3311,17 @@ class _IncomingImapClient extends _IncomingMailClient {
 class _IncomingPopClient extends _IncomingMailClient {
   _IncomingPopClient(
     int? downloadSizeLimit,
-    EventBus eventBus,
     String? logName,
     MailServerConfig config,
     MailClient mailClient, {
     required bool isLogEnabled,
     bool Function(X509Certificate)? onBadCertificate,
-  })  : _popClient = PopClient(
-          bus: eventBus,
-          isLogEnabled: isLogEnabled,
-          logName: logName,
-          onBadCertificate: onBadCertificate,
-        ),
-        super(downloadSizeLimit, config, mailClient);
+  }) : _popClient = PopClient(
+         isLogEnabled: isLogEnabled,
+         logName: logName,
+         onBadCertificate: onBadCertificate,
+       ),
+       super(downloadSizeLimit, config, mailClient);
 
   @override
   ClientBase get client => _popClient;
@@ -3290,6 +3340,15 @@ class _IncomingPopClient extends _IncomingMailClient {
 
   @override
   Future<void> connect({Duration timeout = const Duration(seconds: 20)}) async {
+    if (_popClient.isConnected) {
+      // a POP3 session cannot be refreshed, end the previous one properly
+      // (which also commits pending deletions) instead of leaking its socket
+      try {
+        await _popClient.quit();
+      } catch (e) {
+        await _popClient.disconnect();
+      }
+    }
     final serverConfig = _config.serverConfig;
     final isSecure = serverConfig.socketType == SocketType.ssl;
     await _popClient.connectToServer(
@@ -3298,18 +3357,18 @@ class _IncomingPopClient extends _IncomingMailClient {
       isSecure: isSecure,
       timeout: timeout,
     );
-    if (!isSecure) {
-      //TODO check POP3 server capabilities first
-      if (serverConfig.socketType != SocketType.plainNoStartTls) {
-        await _popClient.startTls();
-      } else {
-        log('Warning: not using secure connection, '
-            'your credentials are not secure.');
-      }
-    }
     try {
-      final authResponse = await _config.authentication
-          .authenticate(serverConfig, pop: _popClient);
+      await _requireEncryption(
+        _popClient,
+        serverConfig,
+        // TODO check the POP3 server capabilities (CAPA) for STLS first
+        supportsStartTls: () async => true,
+        startTls: _popClient.startTls,
+      );
+      final authResponse = await _config.authentication.authenticate(
+        serverConfig,
+        pop: _popClient,
+      );
 
       return authResponse;
     } on PopException catch (e, s) {
@@ -3343,22 +3402,26 @@ class _IncomingPopClient extends _IncomingMailClient {
 
   @override
   Future<List<MimeMessage>> poll() async {
-    final numberOfKNownMessages =
-        _selectedMailbox.toValueOrThrow('no mailbox selected').messagesExists;
+    final mailbox = _selectedMailbox.toValueOrThrow('no mailbox selected');
+    final numberOfKnownMessages = mailbox.messagesExists;
     // in POP3 a new session is required to get a new status
     await connect();
     final status = await _popClient.status();
     final messages = <MimeMessage>[];
     final numberOfMessages = status.numberOfMessages;
-    if (numberOfMessages < numberOfKNownMessages) {
-      //TODO compare list UIDs with known message UIDs
-      // instead of just checking the number of messages
-      final diff = numberOfMessages - numberOfKNownMessages;
-      for (var id = numberOfMessages; id > numberOfMessages - diff; id--) {
-        final message = await _popClient.retrieve(id);
-        messages.add(message);
-        mailClient._fireEvent(MailLoadEvent(message, mailClient));
-      }
+    if (numberOfMessages <= numberOfKnownMessages) {
+      // no new messages, but messages may have been removed by another client
+      mailbox.messagesExists = numberOfMessages;
+    }
+    //TODO compare list UIDs with known message UIDs
+    // instead of just checking the number of messages
+    for (var id = numberOfKnownMessages + 1; id <= numberOfMessages; id++) {
+      final message = await _popClient.retrieve(id);
+      // only count a message once it has been loaded, so that a failed
+      // retrieve does not skip the remaining new messages in the next poll
+      mailbox.messagesExists = id;
+      messages.add(message);
+      mailClient._fireEvent(MailLoadEvent(message, mailClient));
     }
 
     return messages;
@@ -3390,12 +3453,17 @@ class _IncomingPopClient extends _IncomingMailClient {
   ) async {
     if (flags.length == 1 && flags.first == MessageFlags.deleted) {
       if (action == StoreAction.remove) {
+        // RSET un-deletes all messages of this session
         await _popClient.reset();
+
+        return;
       }
       final ids = sequence.toList(_selectedMailbox?.messagesExists);
       for (final id in ids) {
         await _popClient.delete(id);
       }
+
+      return;
     }
     throw InvalidArgumentException('POP does not support storing flags.');
   }
@@ -3567,7 +3635,7 @@ class _IncomingPopClient extends _IncomingMailClient {
 
 abstract class _OutgoingMailClient {
   _OutgoingMailClient({required MailServerConfig mailConfig})
-      : _mailConfig = mailConfig;
+    : _mailConfig = mailConfig;
 
   ClientBase get client;
 
@@ -3594,20 +3662,17 @@ class _OutgoingSmtpClient extends _OutgoingMailClient {
   _OutgoingSmtpClient(
     this.mailClient,
     outgoingClientDomain,
-    EventBus? eventBus,
     String logName,
     MailServerConfig mailConfig, {
     required bool isLogEnabled,
     bool Function(X509Certificate)? onBadCertificate,
-  })  : _smtpClient = SmtpClient(
-          outgoingClientDomain,
-          bus: eventBus,
-          isLogEnabled: isLogEnabled,
-          logName: logName,
-          // defaultWriteTimeout: connectionTimeout,
-          onBadCertificate: onBadCertificate,
-        ),
-        super(mailConfig: mailConfig);
+  }) : _smtpClient = SmtpClient(
+         outgoingClientDomain,
+         isLogEnabled: isLogEnabled,
+         logName: logName,
+         onBadCertificate: onBadCertificate,
+       ),
+       super(mailConfig: mailConfig);
 
   @override
   ClientBase get client => _smtpClient;
@@ -3619,6 +3684,8 @@ class _OutgoingSmtpClient extends _OutgoingMailClient {
 
   Future<void> _connectOutgoingIfRequired() async {
     if (!_smtpClient.isLoggedIn) {
+      // the token may have expired in the meantime
+      await mailClient._prepareConnect();
       final config = _mailConfig.serverConfig;
       final isSecure = config.socketType == SocketType.ssl;
       try {
@@ -3628,19 +3695,16 @@ class _OutgoingSmtpClient extends _OutgoingMailClient {
           isSecure: isSecure,
         );
         await _smtpClient.ehlo();
-        if (!isSecure) {
-          if (_smtpClient.serverInfo.supportsStartTls &&
-              (config.socketType != SocketType.plainNoStartTls)) {
-            await _smtpClient.startTls();
-          } else {
-            _smtpClient.logApp(
-              'Warning: not using secure connection, '
-              'your credentials are not secure.',
-            );
-          }
-        }
-        await _mailConfig.authentication
-            .authenticate(config, smtp: _smtpClient);
+        await _requireEncryption(
+          _smtpClient,
+          config,
+          supportsStartTls: () async => _smtpClient.serverInfo.supportsStartTls,
+          startTls: _smtpClient.startTls,
+        );
+        await _mailConfig.authentication.authenticate(
+          config,
+          smtp: _smtpClient,
+        );
       } on SmtpException catch (e, s) {
         throw MailException.fromSmtp(mailClient, e, s);
       } catch (e, s) {
@@ -3668,7 +3732,9 @@ class _OutgoingSmtpClient extends _OutgoingMailClient {
         await _smtpClient.sendChunkedMessage(
           message,
           from: from,
-          supportUnicode: supportUnicode,
+          // RFC 6531: SMTPUTF8 may only be used when announced
+          supportUnicode:
+              supportUnicode && _smtpClient.serverInfo.supports('SMTPUTF8'),
           use8BitEncoding: use8BitEncoding,
           recipients: recipients,
         );

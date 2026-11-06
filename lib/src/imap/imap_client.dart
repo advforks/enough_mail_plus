@@ -4,10 +4,10 @@ import 'dart:io';
 import 'dart:typed_data';
 
 import 'package:collection/collection.dart' show IterableExtension;
-import 'package:event_bus/event_bus.dart';
 import 'package:json_annotation/json_annotation.dart';
 
 import '../codecs/date_codec.dart';
+import '../codecs/modified_utf7_codec.dart';
 import '../exception.dart';
 import '../message_flags.dart';
 import '../mime_message.dart';
@@ -25,6 +25,7 @@ import 'imap_search.dart';
 import 'mailbox.dart';
 import 'message_sequence.dart';
 import 'metadata.dart';
+import 'namespace.dart';
 import 'qresync.dart';
 import 'response.dart';
 import 'return_option.dart';
@@ -63,9 +64,9 @@ class Capability {
 class ImapServerInfo {
   /// Creates a new server info instance
   ImapServerInfo(ConnectionInfo info)
-      : host = info.host,
-        port = info.port,
-        isSecure = info.isSecure;
+    : host = info.host,
+      port = info.port,
+      isSecure = info.isSecure;
 
   /// [ID](https://tools.ietf.org/html/rfc2971) capability with the value `ID`
   static const String capabilityId = 'ID';
@@ -75,6 +76,9 @@ class ImapServerInfo {
 
   /// [MOVE](https://tools.ietf.org/html/rfc6851) capability with the value `MOVE`
   static const String capabilityMove = 'MOVE';
+
+  /// [NAMESPACE](https://tools.ietf.org/html/rfc2342) capability with the value `NAMESPACE`
+  static const String capabilityNamespace = 'NAMESPACE';
 
   ///  capability with the value `QRESYNC`
   static const String capabilityQresync = 'QRESYNC';
@@ -134,6 +138,9 @@ class ImapServerInfo {
   /// Does the server support [MOVE](https://tools.ietf.org/html/rfc6851)?
   bool get supportsMove => supports(capabilityMove);
 
+  /// Does the server support [NAMESPACE](https://tools.ietf.org/html/rfc2342)?
+  bool get supportsNamespace => supports(capabilityNamespace);
+
   /// Does the server support [QRESYNC](https://tools.ietf.org/html/rfc5162)?
   bool get supportsQresync => supports(capabilityQresync);
 
@@ -175,6 +182,17 @@ class ImapServerInfo {
   bool isEnabled(String capabilityName) =>
       enabledCapabilities.firstWhereOrNull((c) => c.name == capabilityName) !=
       null;
+
+  /// Discards all cached capability information.
+  ///
+  /// RFC 3501 section 6.2.1 requires this after a successful `STARTTLS`:
+  /// everything announced before the TLS upgrade traveled over an
+  /// unprotected connection and may have been tampered with.
+  void clearCapabilities() {
+    capabilities = null;
+    capabilitiesText = null;
+    _supportedThreadingMethods = null;
+  }
 }
 
 /// Possible flag store actions
@@ -219,9 +237,6 @@ enum StatusFlags {
 class ImapClient extends ClientBase {
   /// Creates a new ImapClient instance.
   ///
-  /// Set the [bus] to add your specific `EventBus` to listen to
-  /// IMAP events.
-  ///
   /// Set [isLogEnabled] to `true` for getting log outputs on the standard
   /// output.
   ///
@@ -236,19 +251,22 @@ class ImapClient extends ClientBase {
   /// (or let the user decide) whether to accept the connection or not.
   /// The handler should return `true` to continue the [SecureSocket]
   /// connection.
+  ///
+  /// [securityContext] is an optional [SecurityContext] for mTLS
+  /// (mutual TLS / client certificate authentication).
   ImapClient({
-    EventBus? bus,
     bool isLogEnabled = false,
     String? logName,
     this.defaultWriteTimeout,
     this.defaultResponseTimeout,
     bool Function(X509Certificate)? onBadCertificate,
-  })  : _eventBus = bus ?? EventBus(),
-        super(
-          isLogEnabled: isLogEnabled,
-          logName: logName,
-          onBadCertificate: onBadCertificate,
-        ) {
+    SecurityContext? securityContext,
+  }) : super(
+         isLogEnabled: isLogEnabled,
+         logName: logName,
+         onBadCertificate: onBadCertificate,
+         securityContext: securityContext,
+       ) {
     _imapResponseReader = ImapResponseReader(onServerResponse);
   }
 
@@ -257,24 +275,26 @@ class ImapClient extends ClientBase {
   /// Information about the IMAP service
   ImapServerInfo get serverInfo => _serverInfo;
 
-  /// Allows to listens for events
+  /// Allows listening to events fired by this [ImapClient].
   ///
-  /// If no event bus is specified in the constructor,
-  /// an asynchronous bus is used.
   /// Usage:
-  /// ```
-  /// eventBus.on<ImapExpungeEvent>().listen((event) {
-  ///   // All events are of type ImapExpungeEvent (or subtypes of it).
+  /// ```dart
+  /// imapClient.eventStream.whereType<ImapExpungeEvent>().listen((event) {
   ///   log(event.messageSequenceId);
   /// });
   ///
-  /// eventBus.on<ImapEvent>().listen((event) {
-  ///   // All events are of type ImapEvent (or subtypes of it).
+  /// imapClient.eventStream.listen((event) {
   ///   log(event.eventType);
   /// });
   /// ```
-  EventBus get eventBus => _eventBus;
-  final EventBus _eventBus;
+  Stream<ImapEvent> get eventStream => _eventController.stream;
+  final StreamController<ImapEvent> _eventController =
+      StreamController<ImapEvent>.broadcast();
+
+  /// Adds an [event] to the event stream.
+  ///
+  /// Used internally by parsers to fire IMAP events.
+  void fireEvent(ImapEvent event) => _eventController.add(event);
 
   int _lastUsedCommandId = 0;
   CommandTask? _currentCommandTask;
@@ -284,6 +304,7 @@ class ImapClient extends ClientBase {
 
   bool _isInIdleMode = false;
   CommandTask? _idleCommandTask;
+  Completer<void>? _idleContinuationCompleter;
   final _queue = <CommandTask>[];
   List<CommandTask>? _stashedQueue;
 
@@ -295,7 +316,15 @@ class ImapClient extends ClientBase {
 
   @override
   void onDataReceived(Uint8List data) {
-    _imapResponseReader.onData(data);
+    try {
+      _imapResponseReader.onData(data);
+    } catch (e, s) {
+      // the response stream cannot be interpreted anymore, e.g. because the
+      // server announced a literal above the size limit:
+      logApp('Protocol error, closing connection: $e $s');
+      _completePendingTasksWithError('protocol error: $e');
+      unawaited(disconnect());
+    }
   }
 
   @override
@@ -303,6 +332,8 @@ class ImapClient extends ClientBase {
     ConnectionInfo connectionInfo,
     String serverGreeting,
   ) async {
+    // discard any partial response of a previous connection
+    _imapResponseReader.reset();
     _isInIdleMode = false;
     _serverInfo = ImapServerInfo(connectionInfo);
     final startIndex = serverGreeting.indexOf('[CAPABILITY ');
@@ -332,19 +363,77 @@ class ImapClient extends ClientBase {
     logApp('onConnectionError: $error');
     _isInIdleMode = false;
     _selectedMailbox = null;
-    eventBus.fire(ImapConnectionLostEvent(this));
+    _failPendingIdleContinuation('connection error: $error');
+    // Previously only the event below was fired, so a command that was
+    // awaiting a response when the socket died never completed: with no
+    // responseTimeout set, `await sendCommand(...)` hung for the lifetime of
+    // the process, and even with one it waited out the full timeout for an
+    // error that had already arrived. The event cannot complete the caller's
+    // future on its own.
+    _completePendingTasksWithError('connection lost: $error');
+    fireEvent(ImapConnectionLostEvent(this));
+  }
+
+  /// Error-completes every task that is queued or awaiting a response with
+  /// an [ImapException] carrying the given [message].
+  void _completePendingTasksWithError(String message) {
+    final pending = <CommandTask>[..._queue, ..._tasks.values];
+    _queue.clear();
+    _tasks.clear();
+    _currentCommandTask = null;
+    _idleCommandTask = null;
+    for (final task in pending) {
+      if (task.completer.isCompleted) {
+        continue;
+      }
+      try {
+        task.completer.completeError(ImapException(this, message));
+      } catch (e) {
+        logApp('unable to completeError for task $task: $e');
+      }
+    }
+  }
+
+  @override
+  Future<void> disconnect() async {
+    // Fail-first so any future returned by idleStart(waitForContinuation:true)
+    // is settled before the socket is torn down; otherwise callers awaiting
+    // the continuation would hang forever since onConnectionError is not
+    // invoked on an expected disconnect.
+    _failPendingIdleContinuation('client disconnected');
+    _completePendingTasksWithError('client disconnected');
+
+    return super.disconnect();
   }
 
   /// Logs in the user with the given [name] and [password].
   ///
   /// Requires the IMAP service to support `AUTH=PLAIN` capability.
   Future<List<Capability>> login(String name, String password) async {
-    final cmd = Command(
-      'LOGIN "$name" "$password"',
-      logText: 'LOGIN "$name" "(password scrambled)"',
-      writeTimeout: defaultWriteTimeout,
-      responseTimeout: defaultResponseTimeout,
-    );
+    // RFC 3501: quoted strings may only contain 7-bit text without CR or LF
+    // and need " and \ escaped, anything else has to be sent as a literal.
+    final parts = <String>[];
+    final line = StringBuffer('LOGIN ');
+    _writeImapString(line, parts, name);
+    line.write(' ');
+    _writeImapString(line, parts, password);
+    parts.add(line.toString());
+    final logText =
+        'LOGIN ${_canBeQuoted(name) ? _quote(name) : '{literal}'} '
+        '"(password scrambled)"';
+    final cmd = parts.length == 1
+        ? Command(
+            parts.first,
+            logText: logText,
+            writeTimeout: defaultWriteTimeout,
+            responseTimeout: defaultResponseTimeout,
+          )
+        : Command.withContinuation(
+            parts,
+            logText: logText,
+            writeTimeout: defaultWriteTimeout,
+            responseTimeout: defaultResponseTimeout,
+          );
     final parser = CapabilityParser(serverInfo);
     final response = await sendCommand<List<Capability>>(cmd, parser);
     isLoggedIn = true;
@@ -370,8 +459,10 @@ class ImapClient extends ClientBase {
       writeTimeout: defaultWriteTimeout,
       responseTimeout: defaultResponseTimeout,
     );
-    final response =
-        await sendCommand<List<Capability>>(cmd, CapabilityParser(serverInfo));
+    final response = await sendCommand<List<Capability>>(
+      cmd,
+      CapabilityParser(serverInfo),
+    );
     isLoggedIn = true;
 
     return response;
@@ -392,7 +483,11 @@ class ImapClient extends ClientBase {
   }) async {
     host ??= serverInfo.host;
     port ??= serverInfo.port;
-    final authText = 'n,u=$user,\u{0001}'
+    // RFC 7628 / RFC 5801: "," and "=" in the authorization identity are
+    // escaped as =2C and =3D
+    final escapedUser = user.replaceAll('=', '=3D').replaceAll(',', '=2C');
+    final authText =
+        'n,u=$escapedUser,\u{0001}'
         'host=$host\u{0001}'
         'port=$port\u{0001}'
         'auth=Bearer $accessToken\u{0001}\u{0001}';
@@ -403,8 +498,10 @@ class ImapClient extends ClientBase {
       writeTimeout: defaultWriteTimeout,
       responseTimeout: defaultResponseTimeout,
     );
-    final response =
-        await sendCommand<List<Capability>>(cmd, CapabilityParser(serverInfo));
+    final response = await sendCommand<List<Capability>>(
+      cmd,
+      CapabilityParser(serverInfo),
+    );
     isLoggedIn = true;
 
     return response;
@@ -443,6 +540,10 @@ class ImapClient extends ClientBase {
     );
     log('STARTTLS: upgrading socket to secure one...', initial: 'A');
     await upgradeToSslSocket();
+    // RFC 3501 section 6.2.1: the capabilities received before the upgrade
+    // came over an unprotected connection and must be discarded.
+    serverInfo.clearCapabilities();
+    await capability();
 
     return response;
   }
@@ -460,6 +561,27 @@ class ImapClient extends ClientBase {
     );
 
     return sendCommand(cmd, IdParser());
+  }
+
+  /// Retrieves the personal, other users' and shared namespaces
+  /// of the server.
+  ///
+  /// This requires the server to support the
+  /// [IMAP4 NAMESPACE extension](https://datatracker.ietf.org/doc/html/rfc2342)
+  /// and the client to be authenticated.
+  /// Check [ImapServerInfo.supportsNamespace] to see if the NAMESPACE
+  /// extension is supported.
+  ///
+  /// Returns `null` when the server answered without a well-formed
+  /// `NAMESPACE` response.
+  Future<NamespaceResponse?> namespace() {
+    final cmd = Command(
+      'NAMESPACE',
+      writeTimeout: defaultWriteTimeout,
+      responseTimeout: defaultResponseTimeout,
+    );
+
+    return sendCommand(cmd, NamespaceParser());
   }
 
   /// Checks the capabilities of this server directly
@@ -487,13 +609,12 @@ class ImapClient extends ClientBase {
     MessageSequence sequence, {
     Mailbox? targetMailbox,
     String? targetMailboxPath,
-  }) =>
-      _copyOrMove(
-        'COPY',
-        sequence,
-        targetMailbox: targetMailbox,
-        targetMailboxPath: targetMailboxPath,
-      );
+  }) => _copyOrMove(
+    'COPY',
+    sequence,
+    targetMailbox: targetMailbox,
+    targetMailboxPath: targetMailboxPath,
+  );
 
   /// Copies the specified message(s) from the specified [sequence]
   /// from the currently selected mailbox to the target mailbox.
@@ -508,13 +629,12 @@ class ImapClient extends ClientBase {
     MessageSequence sequence, {
     Mailbox? targetMailbox,
     String? targetMailboxPath,
-  }) =>
-      _copyOrMove(
-        'UID COPY',
-        sequence,
-        targetMailbox: targetMailbox,
-        targetMailboxPath: targetMailboxPath,
-      );
+  }) => _copyOrMove(
+    'UID COPY',
+    sequence,
+    targetMailbox: targetMailbox,
+    targetMailboxPath: targetMailboxPath,
+  );
 
   /// Moves the specified message(s) from the specified [sequence]
   /// from the currently selected mailbox to the target mailbox.
@@ -559,8 +679,10 @@ class ImapClient extends ClientBase {
     String? targetMailboxPath,
   }) {
     if (targetMailbox == null && targetMailboxPath == null) {
-      throw InvalidArgumentException('uidMove() error: Neither targetMailbox '
-          'nor targetMailboxPath defined.');
+      throw InvalidArgumentException(
+        'uidMove() error: Neither targetMailbox '
+        'nor targetMailboxPath defined.',
+      );
     }
 
     return _copyOrMove(
@@ -595,7 +717,8 @@ class ImapClient extends ClientBase {
       ..write(' ')
       ..write(path);
     final cmd = Command(
-      buffer.toString(), writeTimeout: defaultWriteTimeout,
+      buffer.toString(),
+      writeTimeout: defaultWriteTimeout,
       // Use response timeout here? This could be a long running operation...
     );
 
@@ -629,16 +752,15 @@ class ImapClient extends ClientBase {
     StoreAction? action,
     bool? silent,
     int? unchangedSinceModSequence,
-  }) =>
-      _store(
-        false,
-        'STORE',
-        sequence,
-        flags,
-        action: action,
-        silent: silent,
-        unchangedSinceModSequence: unchangedSinceModSequence,
-      );
+  }) => _store(
+    false,
+    'STORE',
+    sequence,
+    flags,
+    action: action,
+    silent: silent,
+    unchangedSinceModSequence: unchangedSinceModSequence,
+  );
 
   /// Updates the [flags] of the message(s) from the specified [sequence]
   /// in the currently selected mailbox.
@@ -664,16 +786,15 @@ class ImapClient extends ClientBase {
     StoreAction? action,
     bool? silent,
     int? unchangedSinceModSequence,
-  }) =>
-      _store(
-        true,
-        'UID STORE',
-        sequence,
-        flags,
-        action: action,
-        silent: silent,
-        unchangedSinceModSequence: unchangedSinceModSequence,
-      );
+  }) => _store(
+    true,
+    'UID STORE',
+    sequence,
+    flags,
+    action: action,
+    silent: silent,
+    unchangedSinceModSequence: unchangedSinceModSequence,
+  );
 
   /// STORE and UID STORE implementation
   Future<StoreImapResult> _store(
@@ -750,13 +871,12 @@ class ImapClient extends ClientBase {
     MessageSequence sequence, {
     bool? silent,
     int? unchangedSinceModSequence,
-  }) =>
-      store(
-        sequence,
-        [MessageFlags.seen],
-        silent: silent,
-        unchangedSinceModSequence: unchangedSinceModSequence,
-      );
+  }) => store(
+    sequence,
+    [MessageFlags.seen],
+    silent: silent,
+    unchangedSinceModSequence: unchangedSinceModSequence,
+  );
 
   /// Mark the messages from the specified [sequence] as unseen/unread.
   ///
@@ -771,14 +891,13 @@ class ImapClient extends ClientBase {
     MessageSequence sequence, {
     bool? silent,
     int? unchangedSinceModSequence,
-  }) =>
-      store(
-        sequence,
-        [MessageFlags.seen],
-        action: StoreAction.remove,
-        silent: silent,
-        unchangedSinceModSequence: unchangedSinceModSequence,
-      );
+  }) => store(
+    sequence,
+    [MessageFlags.seen],
+    action: StoreAction.remove,
+    silent: silent,
+    unchangedSinceModSequence: unchangedSinceModSequence,
+  );
 
   /// Mark the messages from the specified [sequence] as flagged.
   ///
@@ -793,13 +912,12 @@ class ImapClient extends ClientBase {
     MessageSequence sequence, {
     bool? silent,
     int? unchangedSinceModSequence,
-  }) =>
-      store(
-        sequence,
-        [MessageFlags.flagged],
-        silent: silent,
-        unchangedSinceModSequence: unchangedSinceModSequence,
-      );
+  }) => store(
+    sequence,
+    [MessageFlags.flagged],
+    silent: silent,
+    unchangedSinceModSequence: unchangedSinceModSequence,
+  );
 
   /// Mark the messages from the specified [sequence] as unflagged.
   ///
@@ -814,14 +932,13 @@ class ImapClient extends ClientBase {
     MessageSequence sequence, {
     bool? silent,
     int? unchangedSinceModSequence,
-  }) =>
-      store(
-        sequence,
-        [MessageFlags.flagged],
-        action: StoreAction.remove,
-        silent: silent,
-        unchangedSinceModSequence: unchangedSinceModSequence,
-      );
+  }) => store(
+    sequence,
+    [MessageFlags.flagged],
+    action: StoreAction.remove,
+    silent: silent,
+    unchangedSinceModSequence: unchangedSinceModSequence,
+  );
 
   /// Mark the messages from the specified [sequence] as deleted.
   ///
@@ -836,13 +953,12 @@ class ImapClient extends ClientBase {
     MessageSequence sequence, {
     bool? silent,
     int? unchangedSinceModSequence,
-  }) =>
-      store(
-        sequence,
-        [MessageFlags.deleted],
-        silent: silent,
-        unchangedSinceModSequence: unchangedSinceModSequence,
-      );
+  }) => store(
+    sequence,
+    [MessageFlags.deleted],
+    silent: silent,
+    unchangedSinceModSequence: unchangedSinceModSequence,
+  );
 
   /// Mark the messages from the specified [sequence] as not deleted.
   ///
@@ -857,14 +973,13 @@ class ImapClient extends ClientBase {
     MessageSequence sequence, {
     bool? silent,
     int? unchangedSinceModSequence,
-  }) =>
-      store(
-        sequence,
-        [MessageFlags.deleted],
-        action: StoreAction.remove,
-        silent: silent,
-        unchangedSinceModSequence: unchangedSinceModSequence,
-      );
+  }) => store(
+    sequence,
+    [MessageFlags.deleted],
+    action: StoreAction.remove,
+    silent: silent,
+    unchangedSinceModSequence: unchangedSinceModSequence,
+  );
 
   /// Mark the messages from the specified [sequence] as answered.
   ///
@@ -879,13 +994,12 @@ class ImapClient extends ClientBase {
     MessageSequence sequence, {
     bool? silent,
     int? unchangedSinceModSequence,
-  }) =>
-      store(
-        sequence,
-        [MessageFlags.answered],
-        silent: silent,
-        unchangedSinceModSequence: unchangedSinceModSequence,
-      );
+  }) => store(
+    sequence,
+    [MessageFlags.answered],
+    silent: silent,
+    unchangedSinceModSequence: unchangedSinceModSequence,
+  );
 
   /// Mark the messages from the specified [sequence] as not answered.
   ///
@@ -900,14 +1014,13 @@ class ImapClient extends ClientBase {
     MessageSequence sequence, {
     bool? silent,
     int? unchangedSinceModSequence,
-  }) =>
-      store(
-        sequence,
-        [MessageFlags.answered],
-        action: StoreAction.remove,
-        silent: silent,
-        unchangedSinceModSequence: unchangedSinceModSequence,
-      );
+  }) => store(
+    sequence,
+    [MessageFlags.answered],
+    action: StoreAction.remove,
+    silent: silent,
+    unchangedSinceModSequence: unchangedSinceModSequence,
+  );
 
   /// Mark the messages from the specified [sequence] as forwarded.
   ///
@@ -923,13 +1036,12 @@ class ImapClient extends ClientBase {
     MessageSequence sequence, {
     bool? silent,
     int? unchangedSinceModSequence,
-  }) =>
-      store(
-        sequence,
-        [MessageFlags.keywordForwarded],
-        silent: silent,
-        unchangedSinceModSequence: unchangedSinceModSequence,
-      );
+  }) => store(
+    sequence,
+    [MessageFlags.keywordForwarded],
+    silent: silent,
+    unchangedSinceModSequence: unchangedSinceModSequence,
+  );
 
   /// Mark the messages from the specified [sequence] as not forwarded.
   ///
@@ -945,14 +1057,13 @@ class ImapClient extends ClientBase {
     MessageSequence sequence, {
     bool? silent,
     int? unchangedSinceModSequence,
-  }) =>
-      store(
-        sequence,
-        [MessageFlags.keywordForwarded],
-        action: StoreAction.remove,
-        silent: silent,
-        unchangedSinceModSequence: unchangedSinceModSequence,
-      );
+  }) => store(
+    sequence,
+    [MessageFlags.keywordForwarded],
+    action: StoreAction.remove,
+    silent: silent,
+    unchangedSinceModSequence: unchangedSinceModSequence,
+  );
 
   /// Mark the messages from the specified [sequence] as seen/read.
   ///
@@ -967,13 +1078,12 @@ class ImapClient extends ClientBase {
     MessageSequence sequence, {
     bool? silent,
     int? unchangedSinceModSequence,
-  }) =>
-      uidStore(
-        sequence,
-        [MessageFlags.seen],
-        silent: silent,
-        unchangedSinceModSequence: unchangedSinceModSequence,
-      );
+  }) => uidStore(
+    sequence,
+    [MessageFlags.seen],
+    silent: silent,
+    unchangedSinceModSequence: unchangedSinceModSequence,
+  );
 
   /// Mark the messages from the specified [sequence] as unseen/unread.
   ///
@@ -988,14 +1098,13 @@ class ImapClient extends ClientBase {
     MessageSequence sequence, {
     bool? silent,
     int? unchangedSinceModSequence,
-  }) =>
-      uidStore(
-        sequence,
-        [MessageFlags.seen],
-        action: StoreAction.remove,
-        silent: silent,
-        unchangedSinceModSequence: unchangedSinceModSequence,
-      );
+  }) => uidStore(
+    sequence,
+    [MessageFlags.seen],
+    action: StoreAction.remove,
+    silent: silent,
+    unchangedSinceModSequence: unchangedSinceModSequence,
+  );
 
   /// Mark the messages from the specified [sequence] as flagged.
   ///
@@ -1010,13 +1119,12 @@ class ImapClient extends ClientBase {
     MessageSequence sequence, {
     bool? silent,
     int? unchangedSinceModSequence,
-  }) =>
-      uidStore(
-        sequence,
-        [MessageFlags.flagged],
-        silent: silent,
-        unchangedSinceModSequence: unchangedSinceModSequence,
-      );
+  }) => uidStore(
+    sequence,
+    [MessageFlags.flagged],
+    silent: silent,
+    unchangedSinceModSequence: unchangedSinceModSequence,
+  );
 
   /// Mark the messages from the specified [sequence] as unflagged.
   ///
@@ -1031,14 +1139,13 @@ class ImapClient extends ClientBase {
     MessageSequence sequence, {
     bool? silent,
     int? unchangedSinceModSequence,
-  }) =>
-      uidStore(
-        sequence,
-        [MessageFlags.flagged],
-        action: StoreAction.remove,
-        silent: silent,
-        unchangedSinceModSequence: unchangedSinceModSequence,
-      );
+  }) => uidStore(
+    sequence,
+    [MessageFlags.flagged],
+    action: StoreAction.remove,
+    silent: silent,
+    unchangedSinceModSequence: unchangedSinceModSequence,
+  );
 
   /// Mark the messages from the specified [sequence] as deleted.
   ///
@@ -1053,13 +1160,12 @@ class ImapClient extends ClientBase {
     MessageSequence sequence, {
     bool? silent,
     int? unchangedSinceModSequence,
-  }) =>
-      uidStore(
-        sequence,
-        [MessageFlags.deleted],
-        silent: silent,
-        unchangedSinceModSequence: unchangedSinceModSequence,
-      );
+  }) => uidStore(
+    sequence,
+    [MessageFlags.deleted],
+    silent: silent,
+    unchangedSinceModSequence: unchangedSinceModSequence,
+  );
 
   /// Mark the messages from the specified [sequence] as not deleted.
   ///
@@ -1074,14 +1180,13 @@ class ImapClient extends ClientBase {
     MessageSequence sequence, {
     bool? silent,
     int? unchangedSinceModSequence,
-  }) =>
-      uidStore(
-        sequence,
-        [MessageFlags.deleted],
-        action: StoreAction.remove,
-        silent: silent,
-        unchangedSinceModSequence: unchangedSinceModSequence,
-      );
+  }) => uidStore(
+    sequence,
+    [MessageFlags.deleted],
+    action: StoreAction.remove,
+    silent: silent,
+    unchangedSinceModSequence: unchangedSinceModSequence,
+  );
 
   /// Mark the messages from the specified [sequence] as answered.
   ///
@@ -1096,13 +1201,12 @@ class ImapClient extends ClientBase {
     MessageSequence sequence, {
     bool? silent,
     int? unchangedSinceModSequence,
-  }) =>
-      uidStore(
-        sequence,
-        [MessageFlags.answered],
-        silent: silent,
-        unchangedSinceModSequence: unchangedSinceModSequence,
-      );
+  }) => uidStore(
+    sequence,
+    [MessageFlags.answered],
+    silent: silent,
+    unchangedSinceModSequence: unchangedSinceModSequence,
+  );
 
   /// Mark the messages from the specified [sequence] as not answered.
   ///
@@ -1117,14 +1221,13 @@ class ImapClient extends ClientBase {
     MessageSequence sequence, {
     bool? silent,
     int? unchangedSinceModSequence,
-  }) =>
-      uidStore(
-        sequence,
-        [MessageFlags.answered],
-        action: StoreAction.remove,
-        silent: silent,
-        unchangedSinceModSequence: unchangedSinceModSequence,
-      );
+  }) => uidStore(
+    sequence,
+    [MessageFlags.answered],
+    action: StoreAction.remove,
+    silent: silent,
+    unchangedSinceModSequence: unchangedSinceModSequence,
+  );
 
   /// Mark the messages from the specified [sequence] as forwarded.
   ///
@@ -1140,13 +1243,12 @@ class ImapClient extends ClientBase {
     MessageSequence sequence, {
     bool? silent,
     int? unchangedSinceModSequence,
-  }) =>
-      uidStore(
-        sequence,
-        [MessageFlags.keywordForwarded],
-        silent: silent,
-        unchangedSinceModSequence: unchangedSinceModSequence,
-      );
+  }) => uidStore(
+    sequence,
+    [MessageFlags.keywordForwarded],
+    silent: silent,
+    unchangedSinceModSequence: unchangedSinceModSequence,
+  );
 
   /// Mark the messages from the specified [sequence] as not forwarded.
   ///
@@ -1162,14 +1264,13 @@ class ImapClient extends ClientBase {
     MessageSequence sequence, {
     bool? silent,
     int? unchangedSinceModSequence,
-  }) =>
-      uidStore(
-        sequence,
-        [MessageFlags.keywordForwarded],
-        action: StoreAction.remove,
-        silent: silent,
-        unchangedSinceModSequence: unchangedSinceModSequence,
-      );
+  }) => uidStore(
+    sequence,
+    [MessageFlags.keywordForwarded],
+    action: StoreAction.remove,
+    silent: silent,
+    unchangedSinceModSequence: unchangedSinceModSequence,
+  );
 
   /// Trigger a noop (no operation).
   ///
@@ -1203,10 +1304,7 @@ class ImapClient extends ClientBase {
   /// message polling.
   /// Compare [noop], [idleStart]
   Future<Mailbox?> check() {
-    final cmd = Command(
-      'CHECK',
-      writeTimeout: defaultWriteTimeout,
-    );
+    final cmd = Command('CHECK', writeTimeout: defaultWriteTimeout);
 
     return sendCommand<Mailbox?>(cmd, NoopParser(this, _selectedMailbox));
   }
@@ -1274,45 +1372,197 @@ class ImapClient extends ClientBase {
     List<String>? mailboxPatterns,
     List<String>? selectionOptions,
     List<ReturnOption>? returnOptions,
-  }) =>
-      listMailboxesByReferenceAndName(
-        path,
-        recursive ? '*' : '%',
-        mailboxPatterns,
-        selectionOptions,
-        returnOptions,
-      );
+  }) => listMailboxesByReferenceAndName(
+    path,
+    recursive ? '*' : '%',
+    mailboxPatterns,
+    selectionOptions,
+    returnOptions,
+  );
 
   String _encodeFirstMailboxPath(
     Mailbox? preferred,
     String? path,
     Mailbox? third,
   ) {
-    if (preferred == null && path == null && third == null) {
-      throw ImapException(this, 'Invalid mailbox null');
+    // Mailbox.encodedPath is already in its wire format, so only a plain
+    // path given by the caller is encoded: encoding modified UTF-7 again
+    // turns the '&' that starts every non-ASCII run into '&-'.
+    if (preferred != null) {
+      return _quoteMailboxPath(preferred.encodedPath);
     }
-
-    return _encodeMailboxPath(
-      preferred?.encodedPath ?? path ?? third?.encodedPath ?? '',
-    );
+    if (path != null) {
+      return _encodeMailboxPath(path);
+    }
+    if (third != null) {
+      return _quoteMailboxPath(third.encodedPath);
+    }
+    throw ImapException(this, 'Invalid mailbox null');
   }
 
   String _encodeMailboxPath(String path, [bool alwaysQuote = false]) {
-    if (_serverInfo.supportsUtf8) {
-      if (path.startsWith('\"')) {
+    _checkMailboxName(path, 'path');
+    if (_isUtf8Enabled) {
+      if (path.startsWith('"')) {
         return path;
       }
 
-      return '"$path"';
+      return _quote(path);
     }
     final pathSeparator = serverInfo.pathSeparator ?? '/';
-    var encodedPath = Mailbox.encode(path, pathSeparator);
+    final encodedPath = Mailbox.encode(path, pathSeparator);
+    // RFC 3501: '(' ')' '{' are atom-specials and may not appear in an
+    // unquoted atom, so a mailbox such as "Audit(s)" has to be quoted or
+    // the server rejects the command with "BAD Invalid characters in atom".
+    // '"' and '\' additionally have to be escaped within the quotes.
     if (encodedPath.contains(' ') ||
+        encodedPath.contains('(') ||
+        encodedPath.contains(')') ||
+        encodedPath.contains('{') ||
+        encodedPath.contains('"') ||
+        encodedPath.contains(r'\') ||
         (alwaysQuote && !encodedPath.startsWith('"'))) {
-      encodedPath = '"$encodedPath"';
+      if (alwaysQuote && encodedPath.startsWith('"')) {
+        return encodedPath;
+      }
+
+      return _quote(encodedPath);
     }
 
     return encodedPath;
+  }
+
+  /// Quotes an already encoded mailbox path for use in a command.
+  static String _quoteMailboxPath(String encodedPath) {
+    _checkMailboxName(encodedPath, 'encodedPath');
+
+    return _quote(encodedPath);
+  }
+
+  /// Whether mailbox names are sent in UTF-8 instead of modified UTF-7.
+  ///
+  /// This needs `ENABLE UTF8=ACCEPT` (RFC 6855, section 3). Until then the
+  /// server lists mailbox names in modified UTF-7 and may reject UTF-8 in a
+  /// quoted string, Gmail for example with "BAD Could not parse command",
+  /// although it advertises `UTF8=ACCEPT`.
+  bool get _isUtf8Enabled =>
+      _serverInfo.isEnabled(ImapServerInfo.capabilityUtf8Accept);
+
+  static const ModifiedUtf7Codec _modifiedUtf7Codec = ModifiedUtf7Codec();
+
+  /// Converts the decoded [name] or path of a mailbox to its wire form.
+  ///
+  /// Modified UTF-7 leaves ASCII characters such as the path separator as
+  /// they are, so a whole path is encoded at once.
+  String _encodeMailboxName(String name) =>
+      _isUtf8Enabled ? name : _modifiedUtf7Codec.encodeText(name);
+
+  /// Rejects a mailbox name with a line break or NUL: it could only come
+  /// from a malicious server or caller and must never end the command line.
+  static void _checkMailboxName(String value, String argumentName) {
+    if (value.contains('\r') ||
+        value.contains('\n') ||
+        value.contains('\u0000')) {
+      throw ArgumentError.value(
+        value,
+        argumentName,
+        'mailbox names must not contain line breaks',
+      );
+    }
+  }
+
+  /// Renders [value] as an IMAP quoted string, escaping `\` and `"`.
+  static String _quote(String value) =>
+      '"${value.replaceAll(r'\', r'\\').replaceAll('"', r'\"')}"';
+
+  /// Checks if [value] can be sent as a quoted string (RFC 3501 `QUOTED-CHAR`):
+  /// printable 7-bit ASCII only, no CR, LF or NUL.
+  static bool _canBeQuoted(String value) {
+    for (final code in value.codeUnits) {
+      if (code < 0x20 || code > 0x7e) {
+        return false;
+      }
+    }
+
+    return true;
+  }
+
+  /// Appends [value] as an IMAP string to [line]: as a quoted string when
+  /// possible, otherwise as a literal, in which case the line so far is
+  /// completed into [parts] and the literal starts the next part.
+  static void _writeImapString(
+    StringBuffer line,
+    List<String> parts,
+    String value,
+  ) {
+    if (_canBeQuoted(value)) {
+      line.write(_quote(value));
+    } else {
+      line.write('{${utf8.encode(value).length}}');
+      parts.add(line.toString());
+      line
+        ..clear()
+        ..write(value);
+    }
+  }
+
+  /// Creates a command from [cmdText] that may contain literals in the form
+  /// `{n}\n<n bytes>`, e.g. as produced by [SearchQueryBuilder] for non-ASCII
+  /// search terms. Each literal is sent after the server's continuation
+  /// request. Line feeds within the literal data are not mistaken for
+  /// literal boundaries.
+  Command _commandWithLiterals(String cmdText, {Duration? responseTimeout}) {
+    final parts = _splitCommandLiterals(cmdText);
+
+    return parts.length == 1
+        ? Command(
+            cmdText,
+            writeTimeout: defaultWriteTimeout,
+            responseTimeout: responseTimeout,
+          )
+        : Command.withContinuation(
+            parts,
+            writeTimeout: defaultWriteTimeout,
+            responseTimeout: responseTimeout,
+          );
+  }
+
+  static final _literalMarker = RegExp(r'\{(\d+)\}\n');
+
+  static List<String> _splitCommandLiterals(String cmdText) {
+    final parts = <String>[];
+    var partStart = 0;
+    var searchFrom = 0;
+    while (true) {
+      final match = _literalMarker.allMatches(cmdText, searchFrom).firstOrNull;
+      if (match == null) {
+        parts.add(cmdText.substring(partStart));
+
+        return parts;
+      }
+      // the part ends with the `{n}` marker, the literal data follows
+      parts.add(cmdText.substring(partStart, match.end - 1));
+      partStart = match.end;
+      // skip the literal data (n UTF-8 bytes) before looking for the next
+      // marker, it may itself contain `{`, `}` or line feeds
+      var remainingBytes = int.parse(match.group(1)!);
+      var index = partStart;
+      while (remainingBytes > 0 && index < cmdText.length) {
+        final code = cmdText.codeUnitAt(index);
+        if (code >= 0xD800 && code <= 0xDBFF && index + 1 < cmdText.length) {
+          remainingBytes -= 4;
+          index += 2;
+        } else {
+          remainingBytes -= code < 0x80
+              ? 1
+              : code < 0x800
+              ? 2
+              : 3;
+          index++;
+        }
+      }
+      searchFrom = index;
+    }
   }
 
   /// Lists all mailboxes in the path [referenceName] that match
@@ -1427,7 +1677,8 @@ class ImapClient extends ClientBase {
   /// Selects the specified mailbox.
   ///
   /// This allows future search and fetch calls.
-  /// [path] the path or name of the mailbox that should be selected.
+  /// [path] the path or name of the mailbox that should be selected,
+  /// decoded as in [Mailbox.path].
   /// Set [enableCondStore] to true if you want to force-enable `CONDSTORE`.
   /// This is only possible when the `CONDSTORE` or `QRESYNC` capability
   /// is supported.
@@ -1440,16 +1691,18 @@ class ImapClient extends ClientBase {
     bool enableCondStore = false,
     QResyncParameters? qresync,
   }) async {
+    _checkMailboxName(path, 'path');
     if (serverInfo.pathSeparator == null) {
       await listMailboxes();
     }
     final pathSeparator = serverInfo.pathSeparator ?? '/';
     final nameSplitIndex = path.lastIndexOf(pathSeparator);
-    final name =
-        nameSplitIndex == -1 ? path : path.substring(nameSplitIndex + 1);
+    final name = nameSplitIndex == -1
+        ? path
+        : path.substring(nameSplitIndex + 1);
     final box = Mailbox(
-      encodedName: name,
-      encodedPath: path,
+      encodedName: _encodeMailboxName(name),
+      encodedPath: _encodeMailboxName(path),
       pathSeparator: pathSeparator,
       flags: [],
     );
@@ -1474,12 +1727,11 @@ class ImapClient extends ClientBase {
   Future<Mailbox> selectInbox({
     bool enableCondStore = false,
     QResyncParameters? qresync,
-  }) =>
-      selectMailboxByPath(
-        'INBOX',
-        enableCondStore: enableCondStore,
-        qresync: qresync,
-      );
+  }) => selectMailboxByPath(
+    'INBOX',
+    enableCondStore: enableCondStore,
+    qresync: qresync,
+  );
 
   /// Selects the specified mailbox.
   ///
@@ -1496,13 +1748,12 @@ class ImapClient extends ClientBase {
     Mailbox box, {
     bool enableCondStore = false,
     QResyncParameters? qresync,
-  }) =>
-      _selectOrExamine(
-        'SELECT',
-        box,
-        enableCondStore: enableCondStore,
-        qresync: qresync,
-      );
+  }) => _selectOrExamine(
+    'SELECT',
+    box,
+    enableCondStore: enableCondStore,
+    qresync: qresync,
+  );
 
   /// Examines the [box] without selecting it.
   ///
@@ -1523,13 +1774,12 @@ class ImapClient extends ClientBase {
     Mailbox box, {
     bool enableCondStore = false,
     QResyncParameters? qresync,
-  }) =>
-      _selectOrExamine(
-        'EXAMINE',
-        box,
-        enableCondStore: enableCondStore,
-        qresync: qresync,
-      );
+  }) => _selectOrExamine(
+    'EXAMINE',
+    box,
+    enableCondStore: enableCondStore,
+    qresync: qresync,
+  );
 
   /// implementation for both SELECT as well as EXAMINE
   Future<Mailbox> _selectOrExamine(
@@ -1538,7 +1788,7 @@ class ImapClient extends ClientBase {
     bool enableCondStore = false,
     QResyncParameters? qresync,
   }) {
-    final path = '"${box.encodedPath}"';
+    final path = _quoteMailboxPath(box.encodedPath);
     final buffer = StringBuffer()
       ..write(command)
       ..write(' ')
@@ -1591,7 +1841,7 @@ class ImapClient extends ClientBase {
   /// without triggering the expunge events.
   ///
   /// Compare [selectMailbox]
-  Future<void> unselectMailbox() {
+  Future<Mailbox?> unselectMailbox() {
     if (_selectedMailbox == null) {
       return Future.value();
     }
@@ -1602,8 +1852,9 @@ class ImapClient extends ClientBase {
     );
     final parser = NoResponseParser(_selectedMailbox);
     _selectedMailbox = null;
-
-    return sendCommand(cmd, parser);
+    // the type argument must match the parser, otherwise the task's
+    // Response<void> cannot be handed to the parser at runtime
+    return sendCommand<Mailbox?>(cmd, parser);
   }
 
   /// Searches messages by the given [searchCriteria]
@@ -1618,8 +1869,10 @@ class ImapClient extends ClientBase {
     List<ReturnOption>? returnOptions,
     Duration? responseTimeout,
   }) {
-    final parser =
-        SearchParser(isUidSearch: false, isExtended: returnOptions != null);
+    final parser = SearchParser(
+      isUidSearch: false,
+      isExtended: returnOptions != null,
+    );
     final buffer = StringBuffer('SEARCH ');
     if (returnOptions != null) {
       buffer
@@ -1630,18 +1883,7 @@ class ImapClient extends ClientBase {
     buffer.write(searchCriteria);
     final cmdText = buffer.toString();
     buffer.clear();
-    final searchLines = cmdText.split('\n');
-    final cmd = searchLines.length == 1
-        ? Command(
-            cmdText,
-            writeTimeout: defaultWriteTimeout,
-            responseTimeout: responseTimeout,
-          )
-        : Command.withContinuation(
-            searchLines,
-            writeTimeout: defaultWriteTimeout,
-            responseTimeout: responseTimeout,
-          );
+    final cmd = _commandWithLiterals(cmdText, responseTimeout: responseTimeout);
 
     return sendCommand<SearchImapResult>(cmd, parser);
   }
@@ -1653,11 +1895,10 @@ class ImapClient extends ClientBase {
   Future<SearchImapResult> searchMessagesWithQuery(
     SearchQueryBuilder query, {
     Duration? responseTimeout,
-  }) =>
-      searchMessages(
-        searchCriteria: query.toString(),
-        responseTimeout: responseTimeout,
-      );
+  }) => searchMessages(
+    searchCriteria: query.toString(),
+    responseTimeout: responseTimeout,
+  );
 
   /// Searches messages by the given [searchCriteria]
   /// like `'UNSEEN'` or `'RECENT'` or `'FROM sender@domain.com'`.
@@ -1671,8 +1912,10 @@ class ImapClient extends ClientBase {
     List<ReturnOption>? returnOptions,
     Duration? responseTimeout,
   }) {
-    final parser =
-        SearchParser(isUidSearch: true, isExtended: returnOptions != null);
+    final parser = SearchParser(
+      isUidSearch: true,
+      isExtended: returnOptions != null,
+    );
     final buffer = StringBuffer('UID SEARCH ');
     if (returnOptions != null) {
       buffer
@@ -1683,18 +1926,7 @@ class ImapClient extends ClientBase {
     buffer.write(searchCriteria);
     final cmdText = buffer.toString();
     buffer.clear();
-    final searchLines = cmdText.split('\n');
-    final cmd = searchLines.length == 1
-        ? Command(
-            cmdText,
-            writeTimeout: defaultWriteTimeout,
-            responseTimeout: responseTimeout,
-          )
-        : Command.withContinuation(
-            searchLines,
-            writeTimeout: defaultWriteTimeout,
-            responseTimeout: responseTimeout,
-          );
+    final cmd = _commandWithLiterals(cmdText, responseTimeout: responseTimeout);
 
     return sendCommand<SearchImapResult>(cmd, parser);
   }
@@ -1708,12 +1940,11 @@ class ImapClient extends ClientBase {
     SearchQueryBuilder query, {
     List<ReturnOption>? returnOptions,
     Duration? responseTimeout,
-  }) =>
-      uidSearchMessages(
-        searchCriteria: query.toString(),
-        returnOptions: returnOptions,
-        responseTimeout: responseTimeout,
-      );
+  }) => uidSearchMessages(
+    searchCriteria: query.toString(),
+    returnOptions: returnOptions,
+    responseTimeout: responseTimeout,
+  );
 
   /// Fetches a single message by the given definition.
   ///
@@ -1727,12 +1958,11 @@ class ImapClient extends ClientBase {
     int messageSequenceId,
     String fetchContentDefinition, {
     Duration? responseTimeout,
-  }) =>
-      fetchMessages(
-        MessageSequence.fromId(messageSequenceId),
-        fetchContentDefinition,
-        responseTimeout: responseTimeout,
-      );
+  }) => fetchMessages(
+    MessageSequence.fromId(messageSequenceId),
+    fetchContentDefinition,
+    responseTimeout: responseTimeout,
+  );
 
   /// Fetches messages by the given definition.
   ///
@@ -1749,15 +1979,14 @@ class ImapClient extends ClientBase {
     String? fetchContentDefinition, {
     int? changedSinceModSequence,
     Duration? responseTimeout,
-  }) =>
-      _fetchMessages(
-        false,
-        'FETCH',
-        sequence,
-        fetchContentDefinition,
-        changedSinceModSequence: changedSinceModSequence,
-        responseTimeout: responseTimeout,
-      );
+  }) => _fetchMessages(
+    false,
+    'FETCH',
+    sequence,
+    fetchContentDefinition,
+    changedSinceModSequence: changedSinceModSequence,
+    responseTimeout: responseTimeout,
+  );
 
   /// FETCH and UID FETCH implementation
   Future<FetchImapResult> _fetchMessages(
@@ -1841,10 +2070,7 @@ class ImapClient extends ClientBase {
     }
 
     return fetchMessages(
-      MessageSequence.fromRange(
-        lowerMessageSequenceId,
-        upperMessageSequenceId,
-      ),
+      MessageSequence.fromRange(lowerMessageSequenceId, upperMessageSequenceId),
       criteria,
       responseTimeout: responseTimeout,
     );
@@ -1863,14 +2089,13 @@ class ImapClient extends ClientBase {
     int messageUid,
     String fetchContentDefinition, {
     Duration? responseTimeout,
-  }) =>
-      _fetchMessages(
-        true,
-        'UID FETCH',
-        MessageSequence.fromId(messageUid),
-        fetchContentDefinition,
-        responseTimeout: responseTimeout,
-      );
+  }) => _fetchMessages(
+    true,
+    'UID FETCH',
+    MessageSequence.fromId(messageUid),
+    fetchContentDefinition,
+    responseTimeout: responseTimeout,
+  );
 
   /// Fetches messages by the given definition.
   ///
@@ -1889,15 +2114,14 @@ class ImapClient extends ClientBase {
     String? fetchContentDefinition, {
     int? changedSinceModSequence,
     Duration? responseTimeout,
-  }) =>
-      _fetchMessages(
-        true,
-        'UID FETCH',
-        sequence,
-        fetchContentDefinition,
-        changedSinceModSequence: changedSinceModSequence,
-        responseTimeout: responseTimeout,
-      );
+  }) => _fetchMessages(
+    true,
+    'UID FETCH',
+    sequence,
+    fetchContentDefinition,
+    changedSinceModSequence: changedSinceModSequence,
+    responseTimeout: responseTimeout,
+  );
 
   /// Fetches messages by the specified criteria.
   ///
@@ -1925,6 +2149,9 @@ class ImapClient extends ClientBase {
   /// When no [targetMailbox] or [targetMailboxPath] is specified, then the
   /// message will be appended to the currently selected mailbox.
   /// You can specify flags such as `\Seen` or `\Draft` in the [flags] parameter.
+  /// [internalDate], when given, is sent as the APPEND command's optional
+  /// date-time so the server records that as the message's INTERNALDATE
+  /// instead of the time of the append. Most servers sort and display by it.
   /// Specify a [responseTimeout] when a response is expected within the
   /// given time.
   /// Compare also the [appendMessageText] method.
@@ -1933,31 +2160,106 @@ class ImapClient extends ClientBase {
     List<String>? flags,
     Mailbox? targetMailbox,
     String? targetMailboxPath,
+    DateTime? internalDate,
     Duration? responseTimeout,
-  }) =>
-      appendMessageText(
-        message.renderMessage(),
-        flags: flags,
-        targetMailbox: targetMailbox,
-        targetMailboxPath: targetMailboxPath,
-        responseTimeout: responseTimeout,
-      );
+  }) => appendMessageText(
+    message.renderMessage(),
+    flags: flags,
+    targetMailbox: targetMailbox,
+    targetMailboxPath: targetMailboxPath,
+    internalDate: internalDate,
+    responseTimeout: responseTimeout,
+  );
 
   /// Appends the specified MIME [messageText].
   ///
   /// When no [targetMailbox] or [targetMailboxPath] is specified, then the
   /// message will be appended to the currently selected mailbox.
   /// You can specify flags such as `\Seen` or `\Draft` in the [flags] parameter.
+  /// [internalDate], when given, is sent as the APPEND command's optional
+  /// date-time (RFC 3501: `[SP date-time] SP literal`) so the server records
+  /// that as the message's INTERNALDATE instead of the time of the append.
   /// Specify a [responseTimeout] when a response is expected within the
   /// given time.
-  /// Compare also the [appendMessage] method.
+  /// Compare also the [appendMessage] and [appendMessageBytes] methods.
   Future<GenericImapResult> appendMessageText(
     String messageText, {
     List<String>? flags,
     Mailbox? targetMailbox,
     String? targetMailboxPath,
+    DateTime? internalDate,
     Duration? responseTimeout,
   }) {
+    final numberOfBytes = utf8.encode(messageText).length;
+    final cmdText = _buildAppendCommandText(
+      targetMailbox,
+      targetMailboxPath,
+      flags,
+      internalDate,
+      numberOfBytes,
+    );
+    final cmd = Command.withContinuation([
+      cmdText,
+      messageText,
+    ], responseTimeout: responseTimeout);
+
+    return sendCommand<GenericImapResult>(
+      cmd,
+      GenericParser(this, _selectedMailbox),
+    );
+  }
+
+  /// Appends the specified MIME message given as raw [messageBytes].
+  ///
+  /// Byte-exact counterpart to [appendMessageText]: that method's `{n}` byte
+  /// count and the socket's `IOSink.write` both agree on UTF-8, which is
+  /// right for a message rendered as a `String`. This method exists for
+  /// callers holding already-encoded MIME source as bytes, e.g. a message
+  /// fetched with `BODY[]` being copied to another account. Sending those
+  /// through [appendMessageText] would first turn them into a `String`, and
+  /// any byte outside 7-bit ASCII would come back out re-encoded as
+  /// multi-byte UTF-8, corrupting the message and desyncing the declared
+  /// literal length from what is actually sent. Here `{n}` is computed over
+  /// [messageBytes] directly and the same bytes reach the socket, via
+  /// [Command.withRawContinuation].
+  ///
+  /// See [appendMessageText] for the other parameters.
+  Future<GenericImapResult> appendMessageBytes(
+    Uint8List messageBytes, {
+    List<String>? flags,
+    Mailbox? targetMailbox,
+    String? targetMailboxPath,
+    DateTime? internalDate,
+    Duration? responseTimeout,
+  }) {
+    final cmdText = _buildAppendCommandText(
+      targetMailbox,
+      targetMailboxPath,
+      flags,
+      internalDate,
+      messageBytes.length,
+    );
+    final cmd = Command.withRawContinuation(
+      cmdText,
+      messageBytes,
+      responseTimeout: responseTimeout,
+    );
+
+    return sendCommand<GenericImapResult>(
+      cmd,
+      GenericParser(this, _selectedMailbox),
+    );
+  }
+
+  /// Builds the APPEND command line up to and including the literal size,
+  /// `APPEND mailbox [(flags)] ["date-time"] {n}`.
+  String _buildAppendCommandText(
+    Mailbox? targetMailbox,
+    String? targetMailboxPath,
+    List<String>? flags,
+    DateTime? internalDate,
+    int numberOfBytes,
+  ) {
     final path = _encodeFirstMailboxPath(
       targetMailbox,
       targetMailboxPath,
@@ -1972,21 +2274,34 @@ class ImapClient extends ClientBase {
         ..write(flags.join(' '))
         ..write(')');
     }
-    final numberOfBytes = utf8.encode(messageText).length;
+    if (internalDate != null) {
+      buffer
+        ..write(' "')
+        ..write(_encodeAppendDateTime(internalDate))
+        ..write('"');
+    }
     buffer
       ..write(' {')
       ..write(numberOfBytes)
       ..write('}');
-    final cmdText = buffer.toString();
-    final cmd = Command.withContinuation(
-      [cmdText, messageText],
-      responseTimeout: responseTimeout,
-    );
 
-    return sendCommand<GenericImapResult>(
-      cmd,
-      GenericParser(this, _selectedMailbox),
-    );
+    return buffer.toString();
+  }
+
+  static const _appendMonths = [
+    'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', //
+    'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
+  ];
+
+  /// Formats [dateTime] as RFC 3501's `date-time`, e.g.
+  /// `05-Jan-2026 10:00:00 +0000`, for the optional date-time argument of
+  /// the APPEND command.
+  static String _encodeAppendDateTime(DateTime dateTime) {
+    final d = dateTime.toUtc();
+    String two(int n) => n.toString().padLeft(2, '0');
+
+    return '${two(d.day)}-${_appendMonths[d.month - 1]}-${d.year} '
+        '${two(d.hour)}:${two(d.minute)}:${two(d.second)} +0000';
   }
 
   /// Retrieves the specified meta data entry.
@@ -2029,7 +2344,7 @@ class ImapClient extends ClientBase {
     if (maxSize != null || depth != null) {
       cmd += ') ';
     }
-    cmd += '"${mailboxName ?? ''}" ($entry)';
+    cmd += '${_quote(mailboxName ?? '')} ($entry)';
     final parser = MetaDataParser();
 
     return sendCommand<List<MetaDataEntry>>(Command(cmd), parser);
@@ -2038,32 +2353,36 @@ class ImapClient extends ClientBase {
   /// Checks if the specified value can be safely send to the IMAP server
   /// just in double-quotes.
   bool _isSafeForQuotedTransmission(String value) =>
-      value.length < 80 && !value.contains('"') && !value.contains('\n');
+      value.length < 80 && _canBeQuoted(value);
+
+  /// Appends the metadata [value] to [line] either as a quoted string or, if
+  /// that is not possible, as a literal that starts the next part.
+  ///
+  /// The literal is written through the text path of the connection, which
+  /// encodes it as UTF-8, so its size is computed over the UTF-8 encoding.
+  void _writeMetaDataValue(
+    StringBuffer line,
+    List<String> parts,
+    Uint8List value,
+  ) {
+    final text = utf8.decode(value, allowMalformed: true);
+    if (_isSafeForQuotedTransmission(text)) {
+      line.write(_quote(text));
+    } else {
+      line.write('{${utf8.encode(text).length}}');
+      parts.add(line.toString());
+      line
+        ..clear()
+        ..write(text);
+    }
+  }
 
   /// Saves the specified meta data [entry].
   ///
   /// Set [MetaDataEntry.value] to null to delete the specified meta data entry
   /// Compare https://tools.ietf.org/html/rfc5464 for details.
-  Future<Mailbox?> setMetaData(MetaDataEntry entry) {
-    final valueText = entry.valueText;
-    final Command cmd;
-    final value = entry.value;
-    if (value == null || _isSafeForQuotedTransmission(valueText ?? '')) {
-      final cmdText = 'SETMETADATA "${entry.mailboxName}" '
-          '(${entry.name} '
-          '${value == null ? 'NIL' : '"$valueText"'})';
-      cmd = Command(cmdText);
-    } else {
-      // this is a complex command that requires continuation responses
-      final setPart = 'SETMETADATA "${entry.mailboxName}" '
-          '(${entry.name} {${value.length}}';
-      final parts = <String>[setPart, '$valueText)'];
-      cmd = Command.withContinuation(parts);
-    }
-    final parser = NoResponseParser(_selectedMailbox);
-
-    return sendCommand(cmd, parser);
-  }
+  Future<Mailbox?> setMetaData(MetaDataEntry entry) =>
+      setMetaDataEntries([entry]).then((_) => _selectedMailbox);
 
   /// Saves the  given meta data [entries].
   ///
@@ -2072,23 +2391,23 @@ class ImapClient extends ClientBase {
   /// Compare https://tools.ietf.org/html/rfc5464 for details.
   Future<Mailbox?> setMetaDataEntries(List<MetaDataEntry> entries) {
     final parts = <String>[];
-    var cmd = StringBuffer()..write('SETMETADATA ');
-    var entry = entries.first;
-    cmd.write('"${entry.mailboxName}" (');
-    for (entry in entries) {
+    final cmd = StringBuffer()..write('SETMETADATA ');
+    _writeImapString(cmd, parts, entries.first.mailboxName);
+    cmd.write(' (');
+    var isFirst = true;
+    for (final entry in entries) {
+      if (!isFirst) {
+        cmd.write(' ');
+      }
+      isFirst = false;
       cmd
-        ..write(' ')
         ..write(entry.name)
         ..write(' ');
       final value = entry.value;
       if (value == null) {
         cmd.write('NIL');
-      } else if (_isSafeForQuotedTransmission(entry.valueText ?? '')) {
-        cmd.write('"${entry.valueText}"');
       } else {
-        cmd.write('{${value.length}}');
-        parts.add(cmd.toString());
-        cmd = StringBuffer()..write(entry.valueText);
+        _writeMetaDataValue(cmd, parts, value);
       }
     }
     cmd.write(')');
@@ -2115,7 +2434,7 @@ class ImapClient extends ClientBase {
   ///  query that mailbox's status without deselecting the current
   ///  mailbox in the first IMAP4rev1 connection.
   Future<Mailbox> statusMailbox(Mailbox box, List<StatusFlags> flags) {
-    final path = '"${box.encodedPath}"';
+    final path = _quoteMailboxPath(box.encodedPath);
     final buffer = StringBuffer()
       ..write('STATUS ')
       ..write(path)
@@ -2199,7 +2518,7 @@ class ImapClient extends ClientBase {
   /// [box] the mailbox that should be renamed
   /// [newName] the desired future name of the mailbox
   Future<Mailbox> renameMailbox(Mailbox box, String newName) async {
-    final path = '"${box.encodedPath}"';
+    final path = _quoteMailboxPath(box.encodedPath);
 
     final cmd = Command(
       'RENAME $path ${_encodeMailboxPath(newName)}',
@@ -2239,7 +2558,7 @@ class ImapClient extends ClientBase {
       _sendMailboxCommand('UNSUBSCRIBE', box);
 
   Future<Mailbox> _sendMailboxCommand(String command, Mailbox box) async {
-    final path = '"${box.encodedPath}"';
+    final path = _quoteMailboxPath(box.encodedPath);
     final cmd = Command(
       '$command $path',
       writeTimeout: defaultWriteTimeout,
@@ -2254,8 +2573,23 @@ class ImapClient extends ClientBase {
   ///
   /// Requires a mailbox to be selected and the mail service to support IDLE.
   ///
+  /// By default returns immediately after queueing the IDLE command, before
+  /// the server has confirmed entering IDLE state with a `+ idling`
+  /// continuation response. Set [waitForContinuation] to `true` to get a
+  /// future that completes only after the server's continuation response is
+  /// received — at that point the IDLE mode is truly active per RFC 2177 §3
+  /// ("as long as an IDLE command is active, the server is now free to send
+  /// untagged EXISTS, EXPUNGE, and other messages at any time"). This matters
+  /// when the caller plans to disconnect or stop listening right after
+  /// `idleStart()` — without waiting, the command may still be in flight and
+  /// the `+ idling` response can arrive into an already-closed socket
+  /// buffer, confusing proxies or other intermediaries.
+  ///
+  /// The returned future completes with an error if the connection is closed
+  /// or an error occurs before the continuation is received.
+  ///
   /// Compare [idleDone]
-  Future<void> idleStart() {
+  Future<void> idleStart({bool waitForContinuation = false}) {
     if (!isConnected) {
       throw ImapException(this, 'idleStart failed: client is not connected');
     }
@@ -2272,17 +2606,28 @@ class ImapClient extends ClientBase {
 
       return Future.value();
     }
-    final cmd = Command(
-      'IDLE',
-      writeTimeout: defaultWriteTimeout,
-    );
+    final cmd = Command('IDLE', writeTimeout: defaultWriteTimeout);
     final task = CommandTask(cmd, nextId(), NoopParser(this, _selectedMailbox));
     _tasks[task.id] = task;
     _idleCommandTask = task;
-    final result = sendCommandTask(task, returnCompleter: false);
+
+    Completer<void>? continuationCompleter;
+    if (waitForContinuation) {
+      continuationCompleter = Completer<void>();
+      _idleContinuationCompleter = continuationCompleter;
+    }
+
+    // disconnect() and connection errors fail every pending task, but until
+    // the IDLE command is written nobody listens to this one, so the error
+    // would surface as unhandled. idleDone() still receives the result.
+    task.completer.future.ignore();
+    sendCommandTask(task, returnCompleter: false);
     _isInIdleMode = true;
 
-    return result;
+    if (continuationCompleter != null) {
+      return continuationCompleter.future;
+    }
+    return Future.value();
   }
 
   /// Stops the IDLE mode.
@@ -2321,6 +2666,18 @@ class ImapClient extends ClientBase {
       await Future.delayed(const Duration(milliseconds: 200));
     }
     _idleCommandTask = null;
+    _failPendingIdleContinuation('idleDone() called');
+  }
+
+  /// Fails any pending [idleStart] completer waiting for `+ idling`. Called
+  /// from [idleDone], [disconnect] and connection error paths so callers
+  /// do not hang forever when IDLE activation cannot complete.
+  void _failPendingIdleContinuation(String reason) {
+    final pending = _idleContinuationCompleter;
+    _idleContinuationCompleter = null;
+    if (pending != null && !pending.isCompleted) {
+      pending.completeError(ImapException(this, 'idleStart aborted: $reason'));
+    }
   }
 
   /// Sets the quota [resourceLimits] for the the user / [quotaRoot].
@@ -2331,15 +2688,18 @@ class ImapClient extends ClientBase {
     required Map<String, int> resourceLimits,
     String quotaRoot = '""',
   }) {
-    final quotaRootParameter =
-        quotaRoot.contains(' ') ? '"$quotaRoot"' : quotaRoot;
+    final quotaRootParameter = quotaRoot.contains(' ')
+        ? '"$quotaRoot"'
+        : quotaRoot;
     final buffer = StringBuffer()
       ..write('SETQUOTA ')
       ..write(quotaRootParameter)
       ..write(' (')
-      ..write(resourceLimits.entries
-          .map((entry) => '${entry.key} ${entry.value}')
-          .join(' '))
+      ..write(
+        resourceLimits.entries
+            .map((entry) => '${entry.key} ${entry.value}')
+            .join(' '),
+      )
       ..write(')');
     final cmd = Command(
       buffer.toString(),
@@ -2357,8 +2717,9 @@ class ImapClient extends ClientBase {
   /// Note that the server needs to support the
   /// [QUOTA](https://tools.ietf.org/html/rfc2087) capability.
   Future<QuotaResult> getQuota({String quotaRoot = '""'}) {
-    final quotaRootParameter =
-        quotaRoot.contains(' ') ? '"$quotaRoot"' : quotaRoot;
+    final quotaRootParameter = quotaRoot.contains(' ')
+        ? '"$quotaRoot"'
+        : quotaRoot;
     final cmd = Command(
       'GETQUOTA $quotaRootParameter',
       writeTimeout: defaultWriteTimeout,
@@ -2406,8 +2767,10 @@ class ImapClient extends ClientBase {
     String charset = 'UTF-8',
     List<ReturnOption>? returnOptions,
   ]) {
-    final parser =
-        SortParser(isUidSort: false, isExtended: returnOptions != null);
+    final parser = SortParser(
+      isUidSort: false,
+      isExtended: returnOptions != null,
+    );
     final buffer = StringBuffer('SORT ');
     if (returnOptions != null) {
       buffer
@@ -2424,13 +2787,7 @@ class ImapClient extends ClientBase {
       ..write(searchCriteria);
     final cmdText = buffer.toString();
     buffer.clear();
-    final sortLines = cmdText.split('\n');
-    final cmd = sortLines.length == 1
-        ? Command(cmdText, writeTimeout: defaultWriteTimeout)
-        : Command.withContinuation(
-            sortLines,
-            writeTimeout: defaultWriteTimeout,
-          );
+    final cmd = _commandWithLiterals(cmdText);
 
     return sendCommand<SortImapResult>(cmd, parser);
   }
@@ -2452,8 +2809,10 @@ class ImapClient extends ClientBase {
     String charset = 'UTF-8',
     List<ReturnOption>? returnOptions,
   ]) {
-    final parser =
-        SortParser(isUidSort: true, isExtended: returnOptions != null);
+    final parser = SortParser(
+      isUidSort: true,
+      isExtended: returnOptions != null,
+    );
     final buffer = StringBuffer('UID SORT ');
     if (returnOptions != null) {
       buffer
@@ -2470,13 +2829,7 @@ class ImapClient extends ClientBase {
       ..write(searchCriteria);
     final cmdText = buffer.toString();
     buffer.clear();
-    final sortLines = cmdText.split('\n');
-    final cmd = sortLines.length == 1
-        ? Command(cmdText, writeTimeout: defaultWriteTimeout)
-        : Command.withContinuation(
-            sortLines,
-            writeTimeout: defaultWriteTimeout,
-          );
+    final cmd = _commandWithLiterals(cmdText);
 
     return sendCommand<SortImapResult>(cmd, parser);
   }
@@ -2539,14 +2892,13 @@ class ImapClient extends ClientBase {
     String method = 'ORDEREDSUBJECT',
     String charset = 'UTF-8',
     Duration? responseTimeout,
-  }) =>
-      threadMessages(
-        method: method,
-        charset: charset,
-        since: since,
-        threadUids: true,
-        responseTimeout: responseTimeout,
-      );
+  }) => threadMessages(
+    method: method,
+    charset: charset,
+    since: since,
+    threadUids: true,
+    responseTimeout: responseTimeout,
+  );
 
   /// Retrieves the next session-unique command ID
   String nextId() {
@@ -2676,20 +3028,35 @@ class ImapClient extends ClientBase {
     final spaceIndex = line.indexOf(' ');
     if (spaceIndex != -1) {
       final commandId = line.substring(0, spaceIndex);
-      final task = _tasks[commandId];
+      final task = _tasks.remove(commandId);
       if (task != null) {
         if (task == _currentCommandTask) {
           _currentCommandTask = null;
         }
         imapResponse.parseText = line.substring(spaceIndex + 1);
-        final response = task.parse(imapResponse);
+        final Response<dynamic> response;
+        try {
+          response = task.parse(imapResponse);
+        } catch (e, s) {
+          // a parser must never leave the caller hanging: fail the command
+          logApp('Unable to parse response for ${task.command.logText}: $e $s');
+          if (!task.completer.isCompleted) {
+            task.completer.completeError(
+              ImapException(this, 'unable to parse response: $e', details: e),
+              s,
+            );
+          }
+
+          return;
+        }
         try {
           if (!task.completer.isCompleted) {
             if (response.isOkStatus) {
               task.completer.complete(response.result);
             } else {
-              task.completer
-                  .completeError(ImapException(this, response.details));
+              task.completer.completeError(
+                ImapException(this, response.details),
+              );
             }
           }
         } catch (e, s) {
@@ -2713,8 +3080,14 @@ class ImapClient extends ClientBase {
   /// Handles an untagged response from the server
   void onUntaggedResponse(ImapResponse imapResponse) {
     final task = _currentCommandTask;
-    if (task == null || !task.parseUntaggedResponse(imapResponse)) {
-      log('untagged not handled: [$imapResponse] by task $task');
+    try {
+      if (task == null || !task.parseUntaggedResponse(imapResponse)) {
+        log('untagged not handled: [$imapResponse] by task $task');
+      }
+    } catch (e, s) {
+      // malformed untagged data must not abort the processing of the
+      // remaining server responses
+      logApp('Unable to parse untagged response [$imapResponse]: $e $s');
     }
   }
 
@@ -2722,6 +3095,15 @@ class ImapClient extends ClientBase {
   Future onContinuationResponse(ImapResponse imapResponse) async {
     final cmd = _currentCommandTask?.command;
     if (cmd != null) {
+      final rawData = cmd.getRawContinuationResponse();
+      if (rawData != null) {
+        // The literal is still terminated by CRLF, the same as the text path
+        // below, just appended to the raw bytes instead of a String so that
+        // nothing here re-encodes them.
+        await writeData(Uint8List.fromList([...rawData, 13, 10]));
+
+        return;
+      }
       final response = cmd.getContinuationResponse(imapResponse);
       if (response != null) {
         await writeText(response);
@@ -2729,9 +3111,18 @@ class ImapClient extends ClientBase {
         return;
       }
     }
-    if (!_isInIdleMode) {
-      logApp('continuation not handled: [$imapResponse], current cmd: $cmd');
+    if (_isInIdleMode) {
+      // `+ idling` from the server -- IDLE mode is now truly active.
+      // Resolve any pending completer from
+      // idleStart(waitForContinuation: true).
+      final completer = _idleContinuationCompleter;
+      if (completer != null && !completer.isCompleted) {
+        _idleContinuationCompleter = null;
+        completer.complete();
+      }
+      return;
     }
+    logApp('continuation not handled: [$imapResponse], current cmd: $cmd');
   }
 
   /// Closes the connection. Deprecated: use `disconnect()` instead.
@@ -2787,5 +3178,5 @@ class ImapClient extends ClientBase {
   }
 
   @override
-  Object createClientError(String message) => ImapException(this, message);
+  Exception createClientError(String message) => ImapException(this, message);
 }

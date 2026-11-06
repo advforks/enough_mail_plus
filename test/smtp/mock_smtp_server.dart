@@ -1,4 +1,5 @@
 import 'dart:io';
+
 // cSpell:disable
 
 enum _MailSendState { notStarted, rcptTo, data, bdat }
@@ -20,6 +21,9 @@ class MockSmtpServer {
   }
 
   String? nextResponse;
+
+  /// Responses for consecutive requests, consumed before [nextResponse]
+  final List<String> responses = [];
   final Socket _socket;
 
   _MailSendState _sendState = _MailSendState.notStarted;
@@ -35,6 +39,8 @@ class MockSmtpServer {
       return;
     } else if (request == 'QUIT\r\n') {
       writeln('221 2.0.0 Bye');
+    } else if (responses.isNotEmpty) {
+      writeln(responses.removeAt(0));
     } else if (nextResponse == null || nextResponse.isEmpty) {
       // // no supported request found, answer with the pre-defined response:
       writeln('500 Invalid state - define nextResponse for MockSmtpServer');

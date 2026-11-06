@@ -21,12 +21,18 @@ class MockImapServer {
   String? response;
   String? _overrideTag;
 
+  /// Everything the client has sent, one entry per received chunk, so tests
+  /// can assert on the command text actually written to the socket.
+  final requests = <String>[];
+
   void parseRequest(Uint8List data) {
     final line = String.fromCharCodes(data);
+    requests.add(line);
     // print('C: $line');
     final firstSpaceIndex = line.indexOf(' ');
-    String? tag =
-        firstSpaceIndex == -1 ? '' : line.substring(0, firstSpaceIndex);
+    String? tag = firstSpaceIndex == -1
+        ? ''
+        : line.substring(0, firstSpaceIndex);
     final response = this.response;
     if (response != null) {
       if (response.startsWith('+')) {

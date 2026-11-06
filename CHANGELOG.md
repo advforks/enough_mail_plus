@@ -1,3 +1,153 @@
+# v3.0.0
+
+## ⛓️‍💥 Breaking changes
+- **STARTTLS is now enforced.** With `SocketType.starttls` or `plain`, IMAP and SMTP used to send credentials in clear text if the server did not advertise STARTTLS, so a man-in-the-middle only had to strip that capability. The client now refuses to authenticate unless `plainNoStartTls` was explicitly chosen. Capabilities from before the TLS upgrade are discarded, and the certificate is checked against the configured host name.
+- **Streams replace `event_bus`.** Events are now delivered through Dart streams instead of the `event_bus` package.
+
+## 🔒 Security fixes
+
+A security review in September 2026 ([#296](https://github.com/Enough-Software/enough_mail/pull/296)) fixed several serious problems. Upgrading is strongly recommended.
+
+- **STARTTLS is now enforced.** With `SocketType.starttls` or `plain`, IMAP and SMTP used to send credentials in clear text if the server did not advertise STARTTLS, so a man-in-the-middle only had to strip that capability. The client now refuses to authenticate unless `plainNoStartTls` was explicitly chosen. Capabilities from before the TLS upgrade are discarded, and the certificate is checked against the configured host name.
+- **SMTP: DATA payload could be cut short.** Two consecutive lines consisting of a single period ended the DATA phase early, and the rest of the message was run as SMTP commands on the authenticated session. Every line starting with a period is now dot-stuffed correctly. Lines such as `.NET` also no longer lose their leading period.
+- **Header and SMTP envelope injection is blocked.** CR/LF is stripped from header values, so a subject, display name, file name or custom header can no longer start another header. Email addresses with control characters, whitespace, angle brackets or list separators are refused. The address parser handles escaped quotes correctly and no longer crashes on emoji.
+- **IMAP command injection is blocked.** User names, passwords, mailbox names and search terms are now quoted and escaped according to RFC 3501. Credentials containing `"`, `\`, non-ASCII characters or line breaks previously produced malformed or injectable commands.
+- **Bcc recipients could leak.** A long Bcc header is folded over several lines, and only its first line was removed, so every To/Cc recipient received the rest of the Bcc list.
+  - The DATA command was fixed by [David Hobley](https://github.com/hobleyd) ([#294](https://github.com/Enough-Software/enough_mail/pull/294)).
+  - The BDAT command, which is preferred whenever a server announces CHUNKING, had the same problem and is fixed as well. The Bcc header is now removed only from the header section, so a body line starting with `Bcc:` is left alone.
+- **Credentials no longer appear in logs.** `toString()` of `MailAccount`, `MailServerConfig` and `OauthToken` now hides passwords and tokens. `toJson()` is unchanged.
+- **Safer MIME parsing.** Multipart delimiters are only accepted at the start of a line, so a text line cannot smuggle in a part that other clients and scanners do not see. Nesting is limited to 50 levels.
+- **Safer auto-discovery.** Fetching configurations has a timeout and a 1 MiB size limit and no longer follows https-to-http redirects. Results obtained over plain http are flagged through `ClientConfig.isFromInsecureSource`.
+- **Secure random IDs.** Message-IDs and multipart boundaries use `Random.secure()` where available.
+- **Exact plus-alias matching.** `ad+min@example.com` is no longer treated as `admin@example.com`.
+
+## ✨ New features
+
+- **Streams replace `event_bus`.** Events are now delivered through Dart streams instead of the `event_bus` package.
+- **IMAP NAMESPACE extension (RFC 2342).** New `ImapClient.namespace()` returns the personal, other users' and shared namespaces. Contributed by [Dmitry Protasov](https://github.com/xx25) ([#295](https://github.com/Enough-Software/enough_mail/pull/295)).
+- **APPEND with an explicit INTERNALDATE and from raw bytes.** Copied messages keep their original date, and messages fetched with `BODY[]` can be appended without corruption through the new `appendMessageBytes`. Contributed by [David Hobley](https://github.com/hobleyd) ([#292](https://github.com/Enough-Software/enough_mail/pull/292)).
+- **Mutual TLS (mTLS).** `ImapClient`, `SmtpClient` and `ClientBase` accept an optional `SecurityContext` for client certificate authentication. This change also fixes a missing `onBadCertificate` when upgrading to SSL. Contributed by [icd360sevofficial](https://github.com/icd360sevofficial) ([#273](https://github.com/Enough-Software/enough_mail/pull/273)).
+- **`idleStart(waitForContinuation: true)`.** The returned future waits until the server confirms IDLE (RFC 2177), which is useful when handing the connection off to another process. It fails if the connection is lost first. Contributed by [BrLumen](https://github.com/brlumen) ([#274](https://github.com/Enough-Software/enough_mail/pull/274)).
+- **Gmail extensions in FETCH.** `FetchParser` now understands `X-GM-THRID`, `X-GM-MSGID` and `X-GM-LABELS`. Contributed by [dev10m-adv](https://github.com/dev10m-adv) ([#275](https://github.com/Enough-Software/enough_mail/pull/275)).
+- **POP3 with OAuth.** `PopClient.authenticateWithOAuth2()` uses `AUTH XOAUTH2`. `PopClient` also accepts a `SecurityContext`.
+
+## 🐛 Bug fixes
+
+### Messages could be lost, deleted or delivered incorrectly
+
+- **Wrong message deleted.** `deleteMessages()` and the move/trash fallbacks used a plain `STORE` for UID sequences, so a different message could be flagged and permanently removed. They now use `UID STORE` and, where available, `UID EXPUNGE` limited to the affected messages. Where supported, `UNSELECT` replaces `CLOSE`, so messages deleted with `canUndo` are no longer expunged as a side effect.
+- **SMTP ignored rejections.** Negative replies to MAIL FROM, RCPT TO, DATA and BDAT were ignored. A message could be partially delivered while the caller saw success. The transaction is now aborted with `RSET`, the connection stays usable, and the call fails with the rejecting reply.
+- **Invalid envelope addresses** are reported as `SmtpException`, so `MailClient.sendMessage` fails with a `MailException` instead of an uncaught `ArgumentError`.
+- **POP3.** Polling compared message counts the wrong way round and never found new messages. Retrieved messages had no sequence id and could not be deleted or re-fetched, and undelete and `store()` were broken. A failed retrieve no longer makes the next poll skip the remaining new messages.
+- **Quoted-printable attachments** were returned undecoded (`=25PDF=2D1=2E7` instead of `%PDF-1.7`). They are now decoded to their bytes. Contributed by [David Hobley](https://github.com/hobleyd) ([#287](https://github.com/Enough-Software/enough_mail/pull/287)).
+- **Empty body for servers using bare LF line endings.** A fetched `BODY[]` literal is now normalised on the raw bytes, without corrupting non-UTF-8 charsets. Contributed by [David Hobley](https://github.com/hobleyd) ([#293](https://github.com/Enough-Software/enough_mail/pull/293)).
+
+### Connections hanging or breaking
+
+- **Reconnect deadlock.** `MailClient.reconnect()` and `resume()` could hang forever and `disconnect()` could not abort them. The retry interval now grows exponentially, and an aborted reconnect no longer drops events permanently.
+- **Operations hanging on connection problems.** Connecting, and pending IMAP, SMTP and POP commands, now fail instead of waiting forever when the connection is lost, the server stays silent or a write fails.
+  - [David Hobley](https://github.com/hobleyd) fixed the IMAP case ([#288](https://github.com/Enough-Software/enough_mail/pull/288)).
+  - Failed pending tasks report the plain error message instead of nested "connection lost: …" text.
+- **IMAP survives malformed server responses** instead of leaving every later command queued forever. Literal sizes are validated and capped at 128 MiB (configurable), and parsing is bounds-checked.
+- **SMTP: bare reply codes** such as `250<CRLF>` no longer throw and hang the pending command. Contributed by [BrLumen](https://github.com/brlumen) ([#285](https://github.com/Enough-Software/enough_mail/pull/285)).
+- **IMAP IDLE** no longer leaks an unhandled error when it is still queued during a disconnect, which could terminate an isolate with `errorsAreFatal`. Contributed by [BrLumen](https://github.com/brlumen) ([#302](https://github.com/Enough-Software/enough_mail/pull/302)).
+- **Reconnecting clients** reset their response parsers, so a half-received reply from the old connection no longer corrupts the first replies of the next one. Manually connected sockets no longer create an unawaited greeting completer.
+- **SMTP and POP multi-line replies** are framed correctly. A multi-line EHLO reply split across chunks is no longer truncated, and `LIST`/`UIDL` on an empty POP3 mailbox now completes.
+- **OAuth.** Rotated refresh tokens are kept, concurrent refreshes are serialised, and the token is checked for expiry before the SMTP connection is authenticated.
+
+### Mailbox names
+
+- **Parentheses.** Mailbox names such as `INBOX.Financial.Audit(s)` work in extended LIST responses and in commands. Contributed by [David Hobley](https://github.com/hobleyd) ([#289](https://github.com/Enough-Software/enough_mail/pull/289)).
+- **Unquoted mailbox names in STATUS responses**, as sent by Dovecot, are parsed. Previously MESSAGES, UNSEEN and UIDNEXT stayed at 0. Contributed by [David Hobley](https://github.com/hobleyd) ([#290](https://github.com/Enough-Software/enough_mail/pull/290)).
+- **HIGHESTMODSEQ** from a STATUS response is recorded. Contributed by [David Hobley](https://github.com/hobleyd) ([#291](https://github.com/Enough-Software/enough_mail/pull/291)).
+- **No double encoding** of the target mailbox path for APPEND, COPY and MOVE, which servers rejected with e.g. `NO [TRYCREATE]`. Contributed by [BrLumen](https://github.com/brlumen) ([#298](https://github.com/Enough-Software/enough_mail/pull/298)).
+- **Encoding unless `UTF8=ACCEPT` is enabled.** `selectMailboxByPath()` encodes names in modified UTF-7, and UTF-8 is only sent once `UTF8=ACCEPT` has been enabled (RFC 6855). Gmail otherwise answers `BAD Could not parse command`. Contributed by [BrLumen](https://github.com/brlumen) ([#300](https://github.com/Enough-Software/enough_mail/pull/300)).
+
+### Encoding and parsing
+
+- **Date headers.** Half-hour zones west of Greenwich were rendered as `-03-30`, and UTC as `-0000`. Two- and three-digit years now follow RFC 5322.
+- **Header encoding.**
+  - Non-ASCII display names are rendered as bare RFC 2047 encoded-words, not inside quoted strings.
+  - Encoded words are labelled `UTF-8`.
+  - The Q and B encoders no longer break on astral characters such as emoji.
+  - Header folding never splits an encoded word.
+  - Folding no longer happens inside long email addresses or directly after an opening angle bracket. Contributed by [nogringo](https://github.com/nogringo) ([#272](https://github.com/Enough-Software/enough_mail/pull/272)).
+- **Lenient MIME decoding.** Quoted-printable and base64 decoders no longer throw on truncated or invalid input, and undecodable encoded words are kept verbatim. Binary bodies are no longer corrupted by a UTF-8 round trip. Header parameters are split correctly according to RFC 2231.
+- **Bare LF line endings** are tolerated when parsing MIME text. Contributed by [nogringo](https://github.com/nogringo).
+- **Auto-discovery.** `UsernameType.emailLocalPart` now returns the local part instead of the domain, and `forceSslConnection` also updates the generic preferred servers.
+- **DKIM signing.** The signer now hashes the whole canonicalized body and signs From, To, Cc, Subject, Date, Message-ID, MIME-Version and Content-Type. Building a message twice no longer duplicates the text part.
+- **SMTP AUTH PLAIN/LOGIN** credentials are encoded as UTF-8 (RFC 4616), so umlauts and non-Latin-1 characters work.
+
+## ⚡ Performance
+
+- Fixed an O(n²) slowdown in `MailCodec.wrapText()`. Contributed by [nogringo](https://github.com/nogringo) ([#276](https://github.com/Enough-Software/enough_mail/pull/276)).
+- POP3 multi-line reply detection scans only new bytes instead of the whole buffer on every chunk.
+
+## 🧹 Maintenance
+
+- Shared the STARTTLS enforcement and the write-failure handling between the IMAP, POP and SMTP clients.
+- Simplified how the IMAP parser finds the next literal marker.
+- Corrected the package name and upgraded dependencies.
+- Resolved eight `dart analyze` issues ([nogringo](https://github.com/nogringo)).
+- Added tests for quoted-printable edge cases, the SMTP and POP write-failure path, and the new IMAP features.
+- Updated the analysis options, example, readme, docs and changelog.
+
+---
+
+## Contributors
+
+| Contributor | Contributions |
+|---|---|
+| Robert Virkus | Security review, reliability and codec fixes, event streams, maintenance |
+| [David Hobley](https://github.com/hobleyd) | APPEND with INTERNALDATE and raw bytes, Bcc leak fix, six IMAP, codec and parsing fixes |
+| [BrLumen](https://github.com/brlumen) | `idleStart` continuation flag, mailbox path encoding fixes, SMTP bare reply codes, IDLE error leak |
+| [nogringo](https://github.com/nogringo) | Header folding fixes, bare LF tolerance, `wrapText()` performance, analyzer cleanup |
+| [Dmitry Protasov](https://github.com/xx25) | IMAP NAMESPACE extension |
+| [icd360sevofficial](https://github.com/icd360sevofficial) | mTLS `SecurityContext` support |
+| [dev10m-adv](https://github.com/dev10m-adv) | Gmail extension fields in `FetchParser` |
+
+
+# 2.2.4
+* Feat: Support the IMAP `NAMESPACE` extension ([RFC 2342](https://datatracker.ietf.org/doc/html/rfc2342)): `ImapClient.namespace()` returns the personal, other users' and shared namespaces with their prefixes, hierarchy delimiters and response extensions; `ImapServerInfo.supportsNamespace` tells whether the server advertises it.
+* Security: `MailClient` refuses to authenticate over an unencrypted connection unless `SocketType.plainNoStartTls` is chosen explicitly; a missing STARTTLS capability no longer causes a silent clear-text fallback, and capabilities announced before STARTTLS are discarded.
+* Security: SMTP DATA applies RFC 5321 transparency to every line, so message content can no longer terminate the DATA phase early and inject commands.
+* Security: header values are sanitised of CR/LF, display names are rendered as quoted-strings with escaping, email addresses with unsafe characters are rejected for headers, the SMTP envelope and `mailto:` links, and the address parser honours quoted-pairs.
+* Security: the `Bcc` header is stripped on the BDAT path as well, case-insensitively and only within the header section.
+* Security: multipart delimiters are only recognised at the start of a line (RFC 2046), nested multiparts are capped at 50 levels.
+* Security: `MailAccount`, `MailServerConfig` and `OauthToken` redact credentials in `toString()`.
+* Security: auto-discovery bounds HTTP requests (timeout, 1 MiB, no https-to-http redirects), query-encodes the email address, flags configurations retrieved over plain HTTP via `ClientConfig.isFromInsecureSource`, and `forceSslConnection` updates every preferred server.
+* Security: IMAP `LOGIN`, mailbox names, metadata and search terms are quoted with escaping or sent as literals; line breaks in mailbox names are rejected.
+* Fix: malformed IMAP server responses fail the affected command instead of wedging the connection; literals are capped at 128 MiB, `{0}` literals, quoted-pairs, partial fetch items and literal mailbox names are parsed correctly, huge `VANISHED` ranges are rejected.
+* Fix: `MailClient.deleteMessages()` and the move fallback used `STORE` with UID sequences, flagging and expunging the wrong messages; `selectMailbox()` uses `UNSELECT` instead of `CLOSE` where available so that flagged-as-deleted messages are not expunged on folder switch.
+* Fix: `connectToServer()` fails when the server closes the socket or stays silent before its greeting; pending SMTP/POP commands fail on connection loss or disconnect instead of hanging.
+* Fix: POP3 `LIST`/`UIDL` on an empty mailbox complete, large POP3 messages are read in linear time, and SMTP multi-line replies split across TCP chunks are framed correctly.
+* Fix: SMTP `AUTH PLAIN`/`AUTH LOGIN` encode credentials as UTF-8; negative replies to `MAIL FROM`, `RCPT TO`, `DATA` and `BDAT` are honoured and the transaction is reset; `SMTPUTF8` is only sent when announced.
+* Fix: `MailClient.reconnect()`/`resume()` no longer deadlock, the retry interval grows exponentially, and events keep being delivered after a reconnect.
+* Fix: POP3 polling detects new messages, ends the previous session, retrieved messages carry their sequence id, and OAuth accounts authenticate with `AUTH XOAUTH2`.
+* Fix: a rotated OAuth refresh token is kept; token refreshes are serialized; `OauthToken` implements equality.
+* Fix: lenient quoted-printable and base64 decoding, byte-exact `binary`/`8bit` attachment decoding, `getPartWithContentId()` normalisation, text part lookup skips attached messages and text attachments, quote-aware header parameters with RFC 2231 support.
+* Fix: `Date` header zones render correctly (`+0000`, `-0330`), obsolete two-digit years follow RFC 5322, header encoders handle astral characters, folding never splits an encoded word.
+* Fix: `UsernameType.emailLocalPart` returns the local part; secure random Message-IDs; exact plus-alias matching; a working DKIM signer.
+* Fix: a reply that was received only partially when a connection was lost no longer corrupts the parsing of the replies after a reconnect.
+* Fix: non-ASCII display names are rendered as bare RFC 2047 encoded-words restricted to the characters allowed in a phrase instead of being placed inside a quoted-string; encoded words are labelled `UTF-8`.
+* Fix: replace the slow lookbehind regex in `TextMimeData` line ending normalisation with plain string replacements.
+# 2.2.3
+* Chore: Shorten package description to 60-180 characters for pub.dev score
+* Docs: Add example file (example/example.dart)
+* Fix: Resolve dangling library doc comments in all library files
+* Fix: Replace angle brackets with placeholders in documentation comments
+* Chore: Format all Dart files with dart format
+
+# 2.2.2
+* Fix: `removeHeader()` now correctly removes headers from rendered messages. Previously, headers modified via `removeHeader()`, `setHeader()`, or `addHeader()` were not reflected in `renderMessage()` output because the render method used original mimeData instead of modified headers.
+
+# 2.2.1
+* Fix: Tolerate bare LF (`\n`) line endings in MIME parsing. RFC 5322 mandates CRLF but some generators (e.g. Node.js mimetext on Linux) produce bare LF. This caused missing subjects and headers when parsing such MIME.
+
+# 2.2.0
+* Maintenance fork of `enough_mail`
+* Fix: Prevent header folding immediately after opening angle bracket `<` in `From` and other headers to avoid SpamAssassin errors.
+
 # 2.1.7
 * chore: Update plugin and dependencies versions - thanks to [Dr-Usman](https://github.com/Dr-Usman)!
 * chore: pub upgrade to bring in intl 0.20.2 - thanks to [jpohhhh](https://github.com/jpohhhh)!
@@ -300,7 +450,7 @@ Other:
 ## 0.0.30
 - Thanks to [hpoul](https://github.com/hpoul) the XML library now works with both beta and stable flutter channels.
 - Thanks to [hydeparkk](https://github.com/hydeparkk) encoded mailbox paths are now used in copy, move, status and append/
-- Fix decoding message date headers
+- Fix decoding bug for UTF8 8 bit encoded text
 - Fix handling mailboxes with a space in their path
 - Allow to easly serialize and deserialize [MailAccount](https://pub.dev/documentation/enough_mail/latest/mail_mail_account/MailAccount-class.html) to/from JSON.
 - Extended high level [MailClient API](https://pub.dev/documentation/enough_mail/latest/mail_mail_client/MailClient-class.html):

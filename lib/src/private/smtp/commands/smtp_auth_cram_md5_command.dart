@@ -1,5 +1,4 @@
 import 'dart:convert';
-import 'dart:typed_data';
 
 import '../../../mail_crypto.dart';
 import '../../../smtp/smtp_response.dart';
@@ -11,7 +10,7 @@ import '../smtp_command.dart';
 class SmtpAuthCramMd5Command extends SmtpCommand {
   /// Creates a new AUTH CRAM-MD5 command
   SmtpAuthCramMd5Command(this._userName, this._password)
-      : super('AUTH CRAM-MD5');
+    : super('AUTH CRAM-MD5');
 
   final String _userName;
   final String _password;
@@ -29,8 +28,10 @@ C: BASE64(USERNAME, " ", MD5((SECRET XOR opad),MD5((SECRET XOR ipad), NONCE)))
 S: 235 Authentication succeeded
     */
     if (response.code != 334 && response.code != 235) {
-      print('Warning: Unexpected status code during AUTH XOAUTH2: '
-          '${response.code}. Expected: 334 or 235. \nauthSent=$_authSent');
+      print(
+        'Warning: Unexpected status code during AUTH CRAM-MD5: '
+        '${response.code}. Expected: 334 or 235. \nauthSent=$_authSent',
+      );
     }
     if (!_authSent) {
       _authSent = true;
@@ -67,5 +68,5 @@ S: 235 Authentication succeeded
   bool isCommandDone(SmtpResponse response) => _authSent;
 
   @override
-  String toString() => 'AUTH XOAUTH2 <base64 scrambled>';
+  String toString() => 'AUTH CRAM-MD5 <base64 scrambled>';
 }
