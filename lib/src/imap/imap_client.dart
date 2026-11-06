@@ -2620,7 +2620,18 @@ class ImapClient extends ClientBase {
     // disconnect() and connection errors fail every pending task, but until
     // the IDLE command is written nobody listens to this one, so the error
     // would surface as unhandled. idleDone() still receives the result.
-    task.completer.future.ignore();
+    task.completer.future.then(
+      (_) {},
+      onError: (Object error, StackTrace stack) {
+        // A server that refuses IDLE answers with a tagged reply, never `+`.
+        _isInIdleMode = false;
+        if (continuationCompleter != null &&
+            identical(_idleContinuationCompleter, continuationCompleter)) {
+          _idleContinuationCompleter = null;
+          continuationCompleter.completeError(error, stack);
+        }
+      },
+    );
     sendCommandTask(task, returnCompleter: false);
     _isInIdleMode = true;
 

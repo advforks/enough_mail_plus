@@ -63,8 +63,17 @@ class MockSocket implements Socket {
     throw UnimplementedError();
   }
 
+  int closeCount = 0;
+  int destroyCount = 0;
+
+  /// Delivers [error] to the socket listener, as a transport failure would.
+  void emitError(Object error, [StackTrace? stackTrace]) {
+    _subscription.handleError?.call(error, stackTrace ?? StackTrace.current);
+  }
+
   @override
   Future close() {
+    closeCount++;
     _subscription.handleDone?.call();
 
     return Future.value();
@@ -77,7 +86,7 @@ class MockSocket implements Socket {
 
   @override
   void destroy() {
-    print('mock socket destroyed');
+    destroyCount++;
   }
 
   @override

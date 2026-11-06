@@ -2,7 +2,7 @@
 // cSpell:disable
 
 import 'dart:async';
-import 'dart:io' show Platform;
+import 'dart:io' show InternetAddress, Platform, ServerSocket, Socket;
 import 'dart:typed_data';
 
 import 'package:enough_mail/enough_mail.dart';
@@ -1720,6 +1720,75 @@ void main() {
     await Future.delayed(const Duration(milliseconds: 20));
     await client.disconnect();
     await expectation;
+  });
+
+  test('ImapClient idle waitForContinuation fails when IDLE is refused',
+      () async {
+    await _selectInbox();
+    mockServer.response =
+        '* CAPABILITY IMAP4rev1 AUTH=PLAIN\r\n'
+        '<tag> OK LOGIN completed';
+    await client.login('testuser', 'testpassword');
+    mockServer.response = '<tag> NO IDLE disabled';
+
+    await expectLater(
+      client.idleStart(waitForContinuation: true),
+      throwsA(isA<ImapException>()),
+    );
+    expect(client.isConnected, isTrue);
+  });
+
+  test('a socket error releases the socket after clearing isConnected',
+      () async {
+    final connection = MockConnection();
+    final local = ImapClient();
+    local.connect(
+      connection.socketClient,
+      connectionInformation: const ConnectionInfo(
+        'localhost',
+        993,
+        isSecure: true,
+      ),
+    );
+    connection.socketServer.write('* OK ready\r\n');
+    await Future<void>.delayed(const Duration(milliseconds: 15));
+    expect(local.isConnected, isTrue);
+
+    connection.socketClient.emitError('reset');
+    await Future<void>.delayed(Duration.zero);
+
+    expect(local.isConnected, isFalse);
+    expect(connection.socketClient.destroyCount, 1);
+    await local.disconnect();
+    expect(connection.socketClient.destroyCount, 1);
+    expect(connection.socketClient.closeCount, 0);
+  });
+
+  test('disconnect finishes when the peer never closes its side', () async {
+    final server = await ServerSocket.bind(InternetAddress.loopbackIPv4, 0);
+    addTearDown(server.close);
+    final held = <Socket>[];
+    addTearDown(() {
+      for (final socket in held) {
+        socket.destroy();
+      }
+    });
+    server.listen((socket) {
+      held.add(socket);
+      socket.write('* OK ready\r\n');
+      // Keep reading so the client's FIN is seen, but never answer or close.
+      socket.listen((_) {}, onError: (_) {}, cancelOnError: true);
+    });
+
+    final local = ImapClient();
+    await local.connectToServer(
+      '127.0.0.1',
+      server.port,
+      isSecure: false,
+    );
+
+    await local.disconnect().timeout(const Duration(seconds: 5));
+    expect(local.isConnected, isFalse);
   });
 
   test('ImapClient setquota', () async {

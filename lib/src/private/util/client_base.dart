@@ -58,6 +58,12 @@ abstract class ClientBase {
 
   late Socket _socket;
 
+  /// The socket and its listener until they are released. They outlive
+  /// [_isConnected], which a transport error clears before the caller tears
+  /// the session down.
+  Socket? _openSocket;
+  bool _socketListening = false;
+
   /// `true` when it is expected that the socket is closed
   bool isSocketClosingExpected = false;
 
@@ -139,6 +145,7 @@ abstract class ClientBase {
       onTimeout: () {
         isSocketClosingExpected = true;
         _isConnected = false;
+        _openSocket = null;
         socket.destroy();
         throw createClientError(
           'no server greeting received from $host:$port within $timeout',
@@ -173,6 +180,7 @@ abstract class ClientBase {
       _isServerGreetingDone = false;
     }
     _socket = socket;
+    _openSocket = socket;
     _writeFuture = null;
     // if (connectionTimeout != null) {
     //   final timeoutStream = socket.timeout(connectionTimeout!);
@@ -187,9 +195,28 @@ abstract class ClientBase {
       onDone: onConnectionDone,
       onError: _onConnectionError,
     );
+    _socketListening = true;
     // }
     _isConnected = true;
     isSocketClosingExpected = false;
+  }
+
+  /// Stops listening and drops a socket whose transport has failed. Nothing
+  /// can be flushed, and a silent peer must not delay the caller.
+  Future<void> _releaseFailedSocket() async {
+    await _cancelSocketListener();
+    _openSocket?.destroy();
+    _openSocket = null;
+  }
+
+  Future<void> _cancelSocketListener() async {
+    if (!_socketListening) return;
+    _socketListening = false;
+    try {
+      await _socketStreamSubscription.cancel();
+    } catch (e, s) {
+      logApp('Unable to cancel stream subscription: $e $s');
+    }
   }
 
   Future<void> _onConnectionError(Object e, StackTrace s) async {
@@ -200,11 +227,7 @@ abstract class ClientBase {
     _failGreeting('connection error before server greeting: $e');
     if (!isSocketClosingExpected) {
       isSocketClosingExpected = true;
-      try {
-        await _socketStreamSubscription.cancel();
-      } catch (e, s) {
-        logApp('Unable to cancel stream subscription: $e $s');
-      }
+      await _releaseFailedSocket();
       try {
         onConnectionError(e);
       } catch (e, s) {
@@ -225,8 +248,10 @@ abstract class ClientBase {
       onBadCertificate: onBadCertificate,
     );
     logApp('now using secure connection.');
+    _socketListening = false;
     await _socketStreamSubscription.cancel();
     isSocketClosingExpected = true;
+    _openSocket = null;
     _socket.destroy();
     isSocketClosingExpected = false;
     connect(secureSocket);
@@ -255,26 +280,29 @@ abstract class ClientBase {
     _failGreeting('connection closed before server greeting');
     if (!isSocketClosingExpected) {
       isSocketClosingExpected = true;
+      unawaited(_releaseFailedSocket());
       onConnectionError('onDone not expected');
     }
   }
 
-  /// Disconnects from the service
+  /// Disconnects from the service.
+  ///
+  /// Also releases a socket left over when a transport error has already
+  /// cleared [isConnected].
   Future<void> disconnect() async {
-    if (_isConnected) {
-      isLoggedIn = false;
-      _isConnected = false;
-      isSocketClosingExpected = true;
-      try {
-        await _socketStreamSubscription.cancel();
-      } catch (e) {
-        print('unable to cancel subscription $e');
-      }
-      try {
-        await _socket.close();
-      } catch (e) {
-        print('unable to close socket $e');
-      }
+    final socket = _openSocket;
+    if (!_isConnected && socket == null && !_socketListening) return;
+    isLoggedIn = false;
+    _isConnected = false;
+    isSocketClosingExpected = true;
+    _openSocket = null;
+    await _cancelSocketListener();
+    if (socket == null) return;
+    try {
+      await socket.close();
+    } catch (e) {
+      print('unable to close socket $e');
+      socket.destroy();
     }
   }
 
